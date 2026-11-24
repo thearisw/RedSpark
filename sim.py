@@ -1,31 +1,74 @@
-"""Tick-based redstone-style circuit simulator.
+"""Event-driven redstone-style simulator modelled on Java Edition's update order.
 
-This is an original, simplified model inspired by redstone logic. It is not a
-faithful copy of any game's rules. The model in one paragraph:
+This is an original implementation written from public technical write-ups of
+how Java Edition processes redstone. It does not use any game code.
 
-* Levers, lit torches and active repeaters are the *stateful* parts. Everything
-  else (dust levels, powered blocks, lamps) is recomputed instantly from them.
-* A solid block is **strongly** powered by an adjacent lever that is on, a lit
-  torch directly below it, or an active repeater facing into it. A strongly
-  powered block feeds adjacent dust at level 15.
-* A solid block is **weakly** powered by dust on top of it or dust next to it.
-  Weak power affects torches, repeaters and lamps but does not feed dust.
-* Dust takes level 15 from an adjacent source and loses 1 per dust block it
-  travels. Dust connects horizontally and one step up or down diagonally.
-* A torch is attached to a solid block (below it or beside it). Each tick it
-  becomes unlit if that block is powered, and lit otherwise (1 tick delay).
-* A repeater reads the cell behind it and outputs, ``delay`` ticks later, into
-  the cell in front of it (a torch has a fixed delay of 1 tick).
-* A lamp is lit while anything next to it supplies power.
+Time
+    The simulation advances in **game ticks** (20 per second). One redstone
+    tick is 2 game ticks: a torch reacts after 2 gt and a repeater after 2, 4,
+    6 or 8 gt.
 
-Coordinates are ``(x, y, z)`` with ``y`` pointing up.
+What happens inside one game tick (``Circuit.step``)
+    1. The game time advances.
+    2. **Scheduled tile ticks** that are due run in order of (due time,
+       priority, scheduling order). Priority: lower runs first. Repeaters use
+       -3 when facing into another diode that does not face back, -2 when
+       turning off and -1 when turning on. Everything else uses 0.
+    3. Block events and block entities (pistons, hoppers...) would run here.
+       None of the current components use them.
+
+How changes spread
+    Nothing is recomputed globally. When a block changes it sends:
+
+    * **shape updates** (post-placement updates) to its 6 neighbours, which
+      only affect a block's own shape, such as repeater locking or dust
+      connections. Observers will listen to these.
+    * **block updates** (neighbour-changed updates). ``update_neighbors_at(p)``
+      notifies the 6 neighbours of ``p`` in Java's order: west, east, down,
+      up, north, south. A block only re-checks its power when it receives one,
+      which is what makes budding and quasi-connectivity possible.
+
+Components
+    * **Lever**: attached to a block face. Weak power 15 to all neighbours and
+      strong power into the block it is attached to.
+    * **Torch**: attached below or beside. Weak power 15 to all neighbours except
+      its attachment block, and strong power into the block above. It turns off
+      2 gt after its attachment block is powered. 8 toggles within 60 gt burn
+      it out, and it rechecks 160 gt later.
+    * **Repeater**: reads the block behind it (dust counts by its level). After
+      its delay it gives strong power 15 to the block in front. Pulses shorter
+      than the delay are extended. A powered diode facing into its side locks it.
+    * **Dust**: power 0-15. It takes the strongest non-dust signal around it, or
+      the strongest connected dust minus 1. It weakly powers the block below and
+      the blocks it *points* into. A line points along itself, a lone dot points
+      everywhere (the "cross"), and a dust with one connection points straight
+      through. When its level changes, it block-updates around itself and every
+      neighbour (7 positions, 42 updates). Java iterates those positions in hash
+      order ("locational" behaviour); this simulator uses a fixed order.
+    * **Lamp**: turns on as soon as it is powered and off 4 gt after power is lost.
+      It is a conductor.
+    * **Solid block**: a conductor. It is *strongly* powered by direct
+      signals from levers, torches below and repeaters, which feed adjacent dust.
+      It is *weakly* powered by dust pointing into it, which affects components
+      but not dust.
+
+Quasi-connectivity
+    ``has_neighbor_signal_qc`` is the helper that pistons, droppers and
+    dispensers will use: powered if they, *or the position above them*, has a
+    neighbour signal. Because blocks only re-check on updates, those components
+    can be "budded" (quasi-powered without noticing) exactly as in Java.
+
+Simplifications: dust and repeaters do not need a block underneath (the grid
+floor counts as support), and there are no observers, comparators or pistons
+yet. Coordinates are ``(x, y, z)`` with ``y`` up, +x = east and +z = south.
 """
 
 from __future__ import annotations
 
 import copy
+import heapq
+import sys
 from enum import IntEnum
-from typing import Iterator
 
 import numpy as np
 
@@ -40,12 +83,26 @@ class Block(IntEnum):
     LAMP = 6
 
 
-# Direction indices: 0:+x 1:-x 2:+z 3:-z 4:+y 5:-y
+# Direction indices: 0:+x(east) 1:-x(west) 2:+z(south) 3:-z(north) 4:+y(up) 5:-y(down)
 DIRS: list[tuple[int, int, int]] = [(1, 0, 0), (-1, 0, 0), (0, 0, 1), (0, 0, -1), (0, 1, 0), (0, -1, 0)]
 FACING_NAMES = ["+x", "-x", "+z", "-z", "+y", "-y"]
+EAST, WEST, SOUTH, NORTH, UP, DOWN = 0, 1, 2, 3, 4, 5
 OPPOSITE = [1, 0, 3, 2, 5, 4]
-UP, DOWN = 4, 5
-HORIZONTAL = [0, 1, 2, 3]
+HORIZONTAL = [EAST, WEST, SOUTH, NORTH]
+# Java's neighbour update order (Level.updateNeighborsAt): west, east, down, up, north, south.
+UPDATE_ORDER = [WEST, EAST, DOWN, UP, NORTH, SOUTH]
+# Java's Direction.values() order: down, up, north, south, west, east.
+VALUES_ORDER = [DOWN, UP, NORTH, SOUTH, WEST, EAST]
+
+# Delays in game ticks.
+TORCH_DELAY = 2
+LAMP_OFF_DELAY = 4
+BURNOUT_TOGGLES, BURNOUT_WINDOW, BURNOUT_RECOVER = 8, 60, 160
+
+# Tile tick priorities (lower runs first).
+EXTREMELY_HIGH, VERY_HIGH, HIGH, NORMAL = -3, -2, -1, 0
+
+CONDUCTORS = (Block.SOLID, Block.LAMP)
 
 Pos = tuple[int, int, int]
 
@@ -55,61 +112,360 @@ def add(p: Pos, d: int) -> Pos:
     return (p[0] + dx, p[1] + dy, p[2] + dz)
 
 
+def direction_between(a: Pos, b: Pos) -> int:
+    """Direction from a to the adjacent cell b."""
+    return DIRS.index((b[0] - a[0], b[1] - a[1], b[2] - a[2]))
+
+
 class Circuit:
-    """A 3D grid of blocks plus their simulation state."""
+    """A 3D grid of blocks with an event-driven simulation."""
 
     def __init__(self, size: tuple[int, int, int]):
         self.size = tuple(int(s) for s in size)
         self.block = np.zeros(self.size, dtype=np.int8)
-        # TORCH: direction towards the block it is attached to (never +y).
+        # TORCH / LEVER: direction towards the block it is attached to.
         # REPEATER: direction it outputs to (horizontal only).
         self.facing = np.zeros(self.size, dtype=np.int8)
-        self.delay = np.ones(self.size, dtype=np.int8)
-        # Stateful on/off: lever on, torch lit, repeater active, lamp lit.
-        self.state = np.zeros(self.size, dtype=bool)
-        # Derived fields, recomputed by propagate().
-        self.dust = np.zeros(self.size, dtype=np.int8)
-        self.strong = np.zeros(self.size, dtype=bool)
-        self.weak = np.zeros(self.size, dtype=bool)
+        self.delay = np.ones(self.size, dtype=np.int8)       # repeater delay in redstone ticks
+        self.state = np.zeros(self.size, dtype=bool)          # lever on, torch lit, repeater/lamp powered
+        self.dust = np.zeros(self.size, dtype=np.int8)        # dust power level
+        self.locked = np.zeros(self.size, dtype=bool)         # repeater locked
         self.labels: dict[str, Pos] = {}
-        self._rep_buf: dict[Pos, list[bool]] = {}
-        self._pos_cache: dict[Block, list[Pos]] = {}
-        self.ticks = 0
+        self.ticks = 0                                        # game time
+        self._queue: list[tuple[int, int, int, Pos]] = []     # (due, priority, order, pos)
+        self._scheduled: dict[Pos, int] = {}                  # pos -> due tick
+        self._order = 0                                       # tie-breaker: scheduling order
+        self._burnout: dict[Pos, list[int]] = {}
 
-    # ------------------------------------------------------------------ editing
+    # ------------------------------------------------------------------ basics
     def in_bounds(self, p: Pos) -> bool:
-        return all(0 <= p[i] < self.size[i] for i in range(3))
+        return 0 <= p[0] < self.size[0] and 0 <= p[1] < self.size[1] and 0 <= p[2] < self.size[2]
 
     def get(self, p: Pos) -> Block:
-        return Block(self.block[p]) if self.in_bounds(p) else Block.AIR
+        return Block(int(self.block[p])) if self.in_bounds(p) else Block.AIR
 
-    def place(self, p: Pos, kind: Block, facing: int = 0, delay: int = 1,
+    def is_conductor(self, p: Pos) -> bool:
+        return self.get(p) in CONDUCTORS
+
+    def count_blocks(self) -> int:
+        return int(np.count_nonzero(self.block))
+
+    def copy(self) -> "Circuit":
+        clone = copy.copy(self)
+        for name in ("block", "facing", "delay", "state", "dust", "locked"):
+            setattr(clone, name, getattr(self, name).copy())
+        clone.labels = dict(self.labels)
+        clone._queue = list(self._queue)
+        clone._scheduled = dict(self._scheduled)
+        clone._burnout = {k: list(v) for k, v in self._burnout.items()}
+        return clone
+
+    # ---------------------------------------------------------------- signals
+    def _emitted(self, p: Pos, toward: Pos, direct: bool, dust_signals: bool) -> int:
+        """Signal the block at ``p`` sends into the adjacent cell ``toward``.
+
+        ``direct`` asks for strong (direct) power only. With ``dust_signals``
+        False, dust emits nothing (this is how dust reads its surroundings).
+        """
+        kind = self.get(p)
+        if kind == Block.LEVER:
+            if not self.state[p]:
+                return 0
+            return 15 if not direct or toward == add(p, int(self.facing[p])) else 0
+        if kind == Block.TORCH:
+            if not self.state[p]:
+                return 0
+            if direct:
+                return 15 if toward == add(p, UP) else 0
+            return 0 if toward == add(p, int(self.facing[p])) else 15
+        if kind == Block.REPEATER:
+            return 15 if self.state[p] and toward == add(p, int(self.facing[p])) else 0
+        if kind == Block.DUST:
+            if not dust_signals or self.dust[p] == 0:
+                return 0
+            d = direction_between(p, toward)
+            if d == DOWN:
+                return int(self.dust[p])
+            if d == UP:
+                return 0
+            return int(self.dust[p]) if self.dust_points(p, d) else 0
+        return 0
+
+    def direct_signal_to(self, p: Pos, dust_signals: bool = True) -> int:
+        """Strongest direct signal going into ``p`` (how conductors get powered)."""
+        best = 0
+        for d in range(6):
+            q = add(p, d)
+            if self.in_bounds(q):
+                best = max(best, self._emitted(q, p, True, dust_signals))
+                if best >= 15:
+                    break
+        return best
+
+    def signal(self, p: Pos, toward: Pos, dust_signals: bool = True) -> int:
+        """Signal a neighbour at ``toward`` receives from ``p`` (Level.getSignal)."""
+        if not self.in_bounds(p):
+            return 0
+        s = self._emitted(p, toward, False, dust_signals)
+        if self.is_conductor(p):
+            s = max(s, self.direct_signal_to(p, dust_signals))
+        return s
+
+    def has_neighbor_signal(self, p: Pos) -> bool:
+        return any(self.signal(add(p, d), p) > 0 for d in UPDATE_ORDER)
+
+    def has_neighbor_signal_qc(self, p: Pos) -> bool:
+        """Quasi-connectivity check for pistons, droppers and dispensers."""
+        return self.has_neighbor_signal(p) or (self.in_bounds(add(p, UP)) and self.has_neighbor_signal(add(p, UP)))
+
+    def powered(self, p: Pos) -> bool:
+        """Whether a conductor is powered at all (strongly or weakly)."""
+        return self.is_conductor(p) and self.direct_signal_to(p) > 0
+
+    def strongly_powered(self, p: Pos) -> bool:
+        """Powered by something other than dust, so it also feeds adjacent dust."""
+        return self.is_conductor(p) and self.direct_signal_to(p, dust_signals=False) > 0
+
+    # ------------------------------------------------------------------- dust
+    def _connects(self, p: Pos, d: int) -> bool:
+        """Whether dust at ``p`` connects towards horizontal direction ``d``."""
+        q = add(p, d)
+        kind = self.get(q)
+        if kind == Block.DUST:
+            return True
+        if kind in (Block.LEVER, Block.TORCH):
+            return True
+        if kind == Block.REPEATER:
+            return int(self.facing[q]) in (d, OPPOSITE[d])
+        above, below = add(q, UP), add(q, DOWN)
+        if self.get(above) == Block.DUST and not self.is_conductor(add(p, UP)):
+            return True  # climbs onto the block beside it
+        if not self.is_conductor(q) and self.get(below) == Block.DUST:
+            return True  # steps down
+        return False
+
+    def dust_shape(self, p: Pos) -> int:
+        """Bitmask of the sides the dust points to: 1 = +x, 2 = -x, 4 = +z, 8 = -z."""
+        sides = [d for d in HORIZONTAL if self._connects(p, d)]
+        if not sides:
+            sides = list(HORIZONTAL)                 # dot acts as a cross
+        elif len(sides) == 1:
+            sides.append(OPPOSITE[sides[0]])         # one connection: straight line
+        return sum(1 << d for d in sides)
+
+    def dust_points(self, p: Pos, d: int) -> bool:
+        return bool(self.dust_shape(p) & (1 << d))
+
+    def _dust_target(self, p: Pos) -> int:
+        strongest = max((self.signal(add(p, d), p, dust_signals=False) for d in range(6)), default=0)
+        if strongest >= 15:
+            return 15
+        best_wire = 0
+        up_conductor = self.is_conductor(add(p, UP))
+        for d in HORIZONTAL:
+            q = add(p, d)
+            if self.get(q) == Block.DUST:
+                best_wire = max(best_wire, int(self.dust[q]))
+            if self.is_conductor(q):
+                if not up_conductor and self.get(add(q, UP)) == Block.DUST:
+                    best_wire = max(best_wire, int(self.dust[add(q, UP)]))
+            elif self.get(add(q, DOWN)) == Block.DUST:
+                best_wire = max(best_wire, int(self.dust[add(q, DOWN)]))
+        return max(strongest, best_wire - 1)
+
+    def _update_dust(self, p: Pos) -> None:
+        target = self._dust_target(p)
+        if target == self.dust[p]:
+            return
+        self.dust[p] = target
+        for q in [p] + [add(p, d) for d in VALUES_ORDER]:
+            self.update_neighbors_at(q)
+
+    # ------------------------------------------------------------ scheduling
+    def schedule(self, p: Pos, delay: int, priority: int = NORMAL) -> None:
+        if p in self._scheduled:
+            return
+        due = self.ticks + delay
+        self._scheduled[p] = due
+        self._order += 1
+        heapq.heappush(self._queue, (due, priority, self._order, p))
+
+    def has_scheduled_tick(self, p: Pos) -> bool:
+        return p in self._scheduled
+
+    def will_tick_this_tick(self, p: Pos) -> bool:
+        return self._scheduled.get(p) == self.ticks
+
+    # ---------------------------------------------------------------- updates
+    def update_neighbors_at(self, p: Pos) -> None:
+        for d in UPDATE_ORDER:
+            q = add(p, d)
+            if self.in_bounds(q):
+                self.neighbor_changed(q, p)
+
+    def _shape_updates(self, p: Pos) -> None:
+        for d in VALUES_ORDER:
+            q = add(p, d)
+            if self.get(q) == Block.REPEATER:
+                self.locked[q] = self._repeater_locked(q)
+
+    def neighbor_changed(self, p: Pos, source: Pos) -> None:
+        kind = self.get(p)
+        if kind == Block.DUST:
+            self._update_dust(p)
+        elif kind == Block.TORCH:
+            powered = self._torch_input(p)
+            if bool(self.state[p]) == powered and not self.will_tick_this_tick(p):
+                self.schedule(p, TORCH_DELAY)
+        elif kind == Block.REPEATER:
+            self.locked[p] = self._repeater_locked(p)
+            if not self.locked[p]:
+                should = self._repeater_input(p) > 0
+                if bool(self.state[p]) != should and not self.has_scheduled_tick(p):
+                    if self._repeater_prioritized(p):
+                        priority = EXTREMELY_HIGH
+                    elif self.state[p]:
+                        priority = VERY_HIGH
+                    else:
+                        priority = HIGH
+                    self.schedule(p, 2 * int(self.delay[p]), priority)
+        elif kind == Block.LAMP:
+            powered = self.has_neighbor_signal(p)
+            if self.state[p] and not powered:
+                self.schedule(p, LAMP_OFF_DELAY)
+            elif not self.state[p] and powered:
+                self._set_state(p, True)
+
+    def _tile_tick(self, p: Pos) -> None:
+        kind = self.get(p)
+        if kind == Block.TORCH:
+            powered = self._torch_input(p)
+            if self.state[p]:
+                if powered:
+                    self._set_state(p, False)
+                    if self._record_toggle(p):  # burnt out: try again much later
+                        self.schedule(p, BURNOUT_RECOVER)
+            elif not powered and not self._toggled_too_often(p):
+                self._set_state(p, True)
+        elif kind == Block.REPEATER:
+            if self.locked[p]:
+                return
+            should = self._repeater_input(p) > 0
+            if self.state[p] and not should:
+                self._set_state(p, False)
+            elif not self.state[p]:
+                self._set_state(p, True)
+                if not should:  # extend short pulses to the full delay
+                    self.schedule(p, 2 * int(self.delay[p]), VERY_HIGH)
+        elif kind == Block.LAMP:
+            if self.state[p] and not self.has_neighbor_signal(p):
+                self._set_state(p, False)
+
+    # --------------------------------------------------------- component logic
+    def _torch_input(self, p: Pos) -> bool:
+        attached = add(p, int(self.facing[p]))
+        return self.signal(attached, p) > 0
+
+    def _record_toggle(self, p: Pos) -> bool:
+        history = [t for t in self._burnout.get(p, []) if self.ticks - t < BURNOUT_WINDOW]
+        history.append(self.ticks)
+        self._burnout[p] = history
+        return len(history) >= BURNOUT_TOGGLES
+
+    def _toggled_too_often(self, p: Pos) -> bool:
+        return sum(self.ticks - t < BURNOUT_WINDOW for t in self._burnout.get(p, [])) >= BURNOUT_TOGGLES
+
+    def _repeater_input(self, p: Pos) -> int:
+        back = add(p, OPPOSITE[int(self.facing[p])])
+        s = self.signal(back, p)
+        if s < 15 and self.get(back) == Block.DUST:
+            s = max(s, int(self.dust[back]))
+        return s
+
+    def _repeater_locked(self, p: Pos) -> bool:
+        f = int(self.facing[p])
+        for side in HORIZONTAL:
+            if side in (f, OPPOSITE[f]):
+                continue
+            q = add(p, side)
+            if self.get(q) == Block.REPEATER and int(self.facing[q]) == OPPOSITE[side] and self.state[q]:
+                return True
+        return False
+
+    def _repeater_prioritized(self, p: Pos) -> bool:
+        f = int(self.facing[p])
+        front = add(p, f)
+        return self.get(front) == Block.REPEATER and int(self.facing[front]) != OPPOSITE[f]
+
+    def _set_state(self, p: Pos, on: bool) -> None:
+        """Change a component's on/off state and send the updates Java would."""
+        if bool(self.state[p]) == on:
+            return
+        self.state[p] = on
+        kind = self.get(p)
+        self._shape_updates(p)
+        if kind == Block.TORCH:
+            for d in VALUES_ORDER:          # onPlace: update around every neighbour
+                self.update_neighbors_at(add(p, d))
+            self.update_neighbors_at(p)
+        elif kind == Block.REPEATER:        # only the block in front and its neighbours
+            front = add(p, int(self.facing[p]))
+            if self.in_bounds(front):
+                self.neighbor_changed(front, p)
+            for d in UPDATE_ORDER:
+                q = add(front, d)
+                if q != p and self.in_bounds(q):
+                    self.neighbor_changed(q, front)
+        elif kind == Block.LEVER:
+            self.update_neighbors_at(p)
+            self.update_neighbors_at(add(p, int(self.facing[p])))
+        # lamps change with flag 2 in Java: no block updates
+
+    # ----------------------------------------------------------------- editing
+    def place(self, p: Pos, kind: Block, facing: int | None = None, delay: int = 1,
               on: bool = False, label: str | None = None) -> None:
-        p = tuple(p)
+        """Place (or with AIR, remove) a block and let the circuit react."""
+        p = tuple(int(v) for v in p)
         if not self.in_bounds(p):
             raise ValueError(f"{p} is outside the grid {self.size}")
         kind = Block(kind)
+        if facing is None:
+            facing = DOWN if kind in (Block.TORCH, Block.LEVER) else EAST
         if kind == Block.TORCH and facing == UP:
             raise ValueError("a torch cannot hang from the block above it")
         if kind == Block.REPEATER and facing not in HORIZONTAL:
             raise ValueError("a repeater must face horizontally")
         if not 1 <= delay <= 4:
             raise ValueError("repeater delay must be 1..4")
+
+        old = self.get(p)
+        old_state = (int(self.facing[p]), bool(self.state[p]))
         self.block[p] = kind
-        self._pos_cache.clear()
         self.facing[p] = facing
         self.delay[p] = delay
-        # Torches start lit, like freshly placed ones; levers take `on`.
         self.state[p] = True if kind == Block.TORCH else (on if kind == Block.LEVER else False)
-        self._rep_buf.pop(p, None)
-        if kind == Block.REPEATER:
-            self._rep_buf[p] = [False] * (delay - 1)
+        self.dust[p] = 0
+        self.locked[p] = False
+        self._scheduled.pop(p, None)  # a stale tick is ignored when it comes up
         for name, q in list(self.labels.items()):
             if q == p:
                 del self.labels[name]
         if label:
             self.labels[label] = p
-        self.propagate()
+
+        # Updates, in the order Java sends them for a block change.
+        self._shape_updates(p)
+        if old == Block.TORCH or kind == Block.TORCH or old == Block.DUST:
+            for d in VALUES_ORDER:
+                self.update_neighbors_at(add(p, d))
+        if old == Block.LEVER:
+            self.update_neighbors_at(add(p, old_state[0]))
+        if kind == Block.LEVER:
+            self.update_neighbors_at(add(p, facing))
+        if old == Block.REPEATER and old_state[1]:
+            self.update_neighbors_at(add(p, old_state[0]))
+        self.update_neighbors_at(p)
+        self.neighbor_changed(p, p)  # the new block checks its own inputs
 
     def remove(self, p: Pos) -> None:
         self.place(p, Block.AIR)
@@ -118,163 +474,45 @@ class Circuit:
         p = tuple(p)
         if self.get(p) != Block.LEVER:
             raise ValueError(f"no lever at {p}")
-        self.state[p] = bool(on)
-        self.propagate()
+        self._set_state(p, bool(on))
 
     def toggle(self, p: Pos) -> None:
         self.set_lever(p, not self.state[tuple(p)])
 
-    def copy(self) -> "Circuit":
-        return copy.deepcopy(self)
-
-    def positions(self, kind: Block) -> list[Pos]:
-        cached = self._pos_cache.get(kind)
-        if cached is None:
-            cached = [tuple(int(i) for i in idx) for idx in np.argwhere(self.block == kind)]
-            self._pos_cache[kind] = cached
-        return cached
-
-    def count_blocks(self) -> int:
-        return int(np.count_nonzero(self.block))
-
-    # --------------------------------------------------------------- simulation
-    def powered(self, p: Pos) -> bool:
-        """Whether a solid block is powered (strongly or weakly)."""
-        return self.in_bounds(p) and bool(self.strong[p] or self.weak[p])
-
-    def supplies(self, src: Pos, target: Pos) -> bool:
-        """Whether the cell ``src`` delivers power into the adjacent cell ``target``."""
-        if not self.in_bounds(src):
-            return False
-        kind = self.get(src)
-        if kind == Block.LEVER:
-            return bool(self.state[src])
-        if kind == Block.TORCH:
-            return bool(self.state[src]) and add(src, int(self.facing[src])) != target
-        if kind == Block.REPEATER:
-            return bool(self.state[src]) and add(src, int(self.facing[src])) == target
-        if kind == Block.DUST:
-            return self.dust[src] > 0
-        if kind == Block.SOLID:
-            return self.powered(src)
-        return False
-
-    def _dust_links(self, p: Pos) -> Iterator[Pos]:
-        for d in HORIZONTAL:
-            q = add(p, d)
-            if self.get(q) == Block.DUST:
-                yield q
-            for vy in (1, -1):
-                r = (q[0], q[1] + vy, q[2])
-                if self.get(r) == Block.DUST:
-                    yield r
-
-    def propagate(self) -> None:
-        """Recompute dust levels, block power and lamps from the stateful parts."""
-        self.strong[:] = False
-        self.weak[:] = False
-        self.dust[:] = 0
-
-        # 1. Strong power on solid blocks.
-        for p in self.positions(Block.LEVER):
-            if self.state[p]:
-                for d in range(6):
-                    q = add(p, d)
-                    if self.get(q) == Block.SOLID:
-                        self.strong[q] = True
-        for p in self.positions(Block.TORCH):
-            q = add(p, UP)
-            if self.state[p] and self.get(q) == Block.SOLID:
-                self.strong[q] = True
-        for p in self.positions(Block.REPEATER):
-            q = add(p, int(self.facing[p]))
-            if self.state[p] and self.get(q) == Block.SOLID:
-                self.strong[q] = True
-
-        # 2. Dust: sources at 15, then spread with decay (bucketed by level).
-        buckets: list[list[Pos]] = [[] for _ in range(16)]
-        for p in self.positions(Block.DUST):
-            for d in range(6):
-                q = add(p, d)
-                k = self.get(q)
-                if k == Block.SOLID:
-                    fed = bool(self.strong[q])
-                elif k == Block.DUST:
-                    fed = False
-                else:
-                    fed = self.supplies(q, p)
-                if fed:
-                    self.dust[p] = 15
-                    buckets[15].append(p)
-                    break
-        for level in range(15, 1, -1):
-            for p in buckets[level]:
-                if self.dust[p] != level:
-                    continue
-                for q in self._dust_links(p):
-                    if self.dust[q] < level - 1:
-                        self.dust[q] = level - 1
-                        buckets[level - 1].append(q)
-
-        # 3. Weak power from dust: the block below it and blocks beside it.
-        for p in self.positions(Block.DUST):
-            if self.dust[p] > 0:
-                for d in HORIZONTAL + [DOWN]:
-                    q = add(p, d)
-                    if self.get(q) == Block.SOLID:
-                        self.weak[q] = True
-
-        # 4. Lamps react instantly.
-        for p in self.positions(Block.LAMP):
-            self.state[p] = any(self.supplies(add(p, d), p) for d in range(6))
+    # -------------------------------------------------------------- simulation
+    def step(self, n: int = 1) -> None:
+        """Advance ``n`` game ticks (20 per second)."""
+        for _ in range(n):
+            self.ticks += 1
+            ran = 0
+            while self._queue and self._queue[0][0] <= self.ticks and ran < 65536:
+                due, _, _, p = heapq.heappop(self._queue)
+                if self._scheduled.get(p) != due:
+                    continue  # cancelled by a block change
+                del self._scheduled[p]
+                self._tile_tick(p)
+                ran += 1
 
     def is_settled(self) -> bool:
-        """True if the next tick cannot change anything (a fixed point)."""
-        for p in self.positions(Block.TORCH):
-            attached = add(p, int(self.facing[p]))
-            off = self.get(attached) == Block.SOLID and self.powered(attached)
-            if self.state[p] == off:
-                return False
-        for p in self.positions(Block.REPEATER):
-            inp = self.supplies(add(p, OPPOSITE[int(self.facing[p])]), p)
-            if self.state[p] != inp or any(b != inp for b in self._rep_buf.get(p, [])):
-                return False
-        return True
+        """True when nothing is scheduled, so nothing will change on its own."""
+        return not self._scheduled
 
-    def settle(self, max_ticks: int = 64) -> bool:
-        """Step until nothing changes. Returns False if still changing after ``max_ticks``."""
+    def settle(self, max_ticks: int = 200) -> bool:
+        """Step until no ticks are pending. Returns False if still busy after ``max_ticks``."""
         for _ in range(max_ticks):
             if self.is_settled():
                 return True
             self.step()
         return self.is_settled()
 
-    def step(self, n: int = 1) -> None:
-        """Advance the simulation by ``n`` ticks."""
-        for _ in range(n):
-            self.propagate()
-            new_state = self.state.copy()
-            for p in self.positions(Block.TORCH):
-                attached = add(p, int(self.facing[p]))
-                off = self.get(attached) == Block.SOLID and self.powered(attached)
-                new_state[p] = not off
-            for p in self.positions(Block.REPEATER):
-                back = add(p, OPPOSITE[int(self.facing[p])])
-                buf = self._rep_buf.setdefault(p, [False] * (int(self.delay[p]) - 1))
-                buf.append(self.supplies(back, p))
-                new_state[p] = buf.pop(0)
-            self.state = new_state
-            self.propagate()
-            self.ticks += 1
-
-    # ------------------------------------------------------------ serialisation
+    # ----------------------------------------------------------- serialisation
     def to_dict(self, include_state: bool = True) -> dict:
         blocks = []
         for idx in np.argwhere(self.block != Block.AIR):
             p = tuple(int(i) for i in idx)
-            kind = Block(self.block[p])
+            kind = Block(int(self.block[p]))
             entry: dict = {"pos": list(p), "type": kind.name.lower()}
-            if kind in (Block.TORCH, Block.REPEATER):
+            if kind in (Block.TORCH, Block.REPEATER, Block.LEVER):
                 entry["facing"] = FACING_NAMES[int(self.facing[p])]
             if kind == Block.REPEATER:
                 entry["delay"] = int(self.delay[p])
@@ -284,18 +522,26 @@ class Circuit:
             if label:
                 entry["label"] = label
             if include_state:
-                entry["active"] = bool(self.state[p]) if kind != Block.SOLID else self.powered(p)
+                entry["active"] = self.powered(p) if kind == Block.SOLID else bool(self.state[p])
                 if kind == Block.DUST:
                     entry["level"] = int(self.dust[p])
+                    entry["shape"] = self.dust_shape(p)
+                if kind == Block.REPEATER and self.locked[p]:
+                    entry["locked"] = True
             blocks.append(entry)
         return {"size": list(self.size), "ticks": self.ticks, "blocks": blocks}
 
     @classmethod
-    def from_dict(cls, data: dict) -> "Circuit":
+    def from_dict(cls, data: dict, settle: bool = True) -> "Circuit":
         c = cls(tuple(data["size"]))
         for b in data["blocks"]:
             kind = Block[b["type"].upper()]
-            facing = FACING_NAMES.index(b.get("facing", "+x"))
+            facing = FACING_NAMES.index(b["facing"]) if "facing" in b else None
             c.place(tuple(b["pos"]), kind, facing=facing, delay=b.get("delay", 1),
                     on=b.get("on", False), label=b.get("label"))
+        if settle:
+            c.settle()
         return c
+
+
+sys.setrecursionlimit(max(sys.getrecursionlimit(), 20000))

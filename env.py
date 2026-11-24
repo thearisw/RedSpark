@@ -78,7 +78,7 @@ class RedstoneGateEnv(gym.Env):
         obs = np.zeros(self.obs_shape, dtype=np.float32)
         for k in range(N_BLOCK_TYPES):
             obs[k] = c.block == k
-        has_facing = (c.block == Block.TORCH) | (c.block == Block.REPEATER)
+        has_facing = (c.block == Block.TORCH) | (c.block == Block.REPEATER) | (c.block == Block.LEVER)
         for d in range(6):
             obs[N_BLOCK_TYPES + d] = has_facing & (c.facing == d)
         for p in self.fixed:
@@ -100,6 +100,8 @@ class RedstoneGateEnv(gym.Env):
             return False  # would change nothing
         if kind == Block.TORCH:
             return c.get(add(pos, facing)) == Block.SOLID
+        if kind in (Block.DUST, Block.REPEATER) and pos[1] > 0:
+            return c.is_conductor(add(pos, DOWN))  # needs a block underneath (y=0 sits on the floor)
         return True
 
     def action_masks(self) -> np.ndarray:
