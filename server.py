@@ -146,6 +146,7 @@ class Training:
         self.gps = 10.0        # generations per second, 0 = as fast as possible
         self.show = "best"
         self.render_hz = 4.0
+        self._wake = asyncio.Event()  # cuts the between-generations wait short on pause
 
     def configure(self, msg: dict) -> None:
         if "gps" in msg:
@@ -190,6 +191,7 @@ class Training:
 
     async def stop(self) -> None:
         self.running = False
+        self._wake.set()
         if self.task is not None:
             await self.task  # finishes the generation in progress, then flushes
             self.task = None
@@ -230,6 +232,7 @@ class Training:
         candidate = None
         last_stats = last_circuit = 0.0
         while self.running:
+            self._wake.clear()
             started = time.monotonic()
             stats = await asyncio.to_thread(self.trainer.generation)
             pending.append(stats.to_dict())
@@ -243,7 +246,10 @@ class Training:
                 await self.send_progress(pending)
                 pending, last_stats = [], now
             wait = (1.0 / self.gps - (time.monotonic() - started)) if self.gps > 0 else 0.0
-            await asyncio.sleep(max(0.0, wait))  # also lets messages from the viewer in
+            try:  # also lets messages from the viewer in
+                await asyncio.wait_for(self._wake.wait(), max(0.0, wait))
+            except asyncio.TimeoutError:
+                pass
         if candidate is not None:
             await self.send_circuit(candidate.best, candidate.gen, self.show)
         await self.send_progress(pending)
