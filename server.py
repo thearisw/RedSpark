@@ -1,6 +1,10 @@
-"""FastAPI backend: serves circuits and streams simulation state over a WebSocket.
+"""Backend: serves circuits and streams simulation state over a WebSocket.
 
-    uvicorn redspark.server:app --reload
+    python -m uvicorn redspark.server:app --port 8000
+
+It also serves the prebuilt viewer from redspark/viewer/ at "/", so no Node is
+needed to use the app (see redspark/app.py for the one-click launcher).
+Built on Starlette (pure Python, no compiled dependencies).
 
 WebSocket protocol on /ws (JSON messages):
 
@@ -22,16 +26,19 @@ import asyncio
 import json
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
-from fastapi.middleware.cors import CORSMiddleware
+from starlette.applications import Starlette
+from starlette.middleware import Middleware
+from starlette.middleware.cors import CORSMiddleware
+from starlette.requests import Request
+from starlette.responses import JSONResponse
+from starlette.routing import Mount, Route, WebSocketRoute
+from starlette.staticfiles import StaticFiles
+from starlette.websockets import WebSocket, WebSocketDisconnect
 
 from .sim import Block, Circuit
 
 CIRCUITS_DIR = Path(__file__).resolve().parents[1] / "circuits"
-
-app = FastAPI(title="RedSpark")
-app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:5173"], allow_methods=["*"],
-                   allow_headers=["*"])
+VIEWER_DIR = Path(__file__).resolve().parent / "viewer"  # built by `npm run build` in web/
 
 
 def circuit_names() -> list[str]:
@@ -44,17 +51,16 @@ def load_circuit(name: str) -> Circuit:
     return Circuit.from_dict(json.loads((CIRCUITS_DIR / f"{name}.json").read_text()))
 
 
-@app.get("/api/circuits")
-def list_circuits() -> list[str]:
-    return circuit_names()
+async def list_circuits(request: Request) -> JSONResponse:
+    return JSONResponse(circuit_names())
 
 
-@app.get("/api/circuits/{name}")
-def get_circuit(name: str) -> dict:
+async def get_circuit(request: Request) -> JSONResponse:
+    name = request.path_params["name"]
     try:
-        return load_circuit(name).to_dict()
+        return JSONResponse(load_circuit(name).to_dict())
     except KeyError:
-        raise HTTPException(404, f"no circuit named {name}")
+        return JSONResponse({"detail": f"no circuit named {name}"}, status_code=404)
 
 
 class Session:
@@ -92,7 +98,6 @@ class Session:
         await self.send_state()
 
 
-@app.websocket("/ws")
 async def websocket(ws: WebSocket) -> None:
     await ws.accept()
     session = Session(ws)
@@ -111,3 +116,18 @@ async def websocket(ws: WebSocket) -> None:
                 await ws.send_json({"type": "error", "message": str(exc)})
     except WebSocketDisconnect:
         pass
+
+
+routes = [
+    Route("/api/circuits", list_circuits),
+    Route("/api/circuits/{name}", get_circuit),
+    WebSocketRoute("/ws", websocket),
+]
+if VIEWER_DIR.is_dir():
+    routes.append(Mount("/", StaticFiles(directory=VIEWER_DIR, html=True), name="viewer"))
+
+app = Starlette(
+    routes=routes,
+    middleware=[Middleware(CORSMiddleware, allow_origins=["http://localhost:5173"],
+                           allow_methods=["*"], allow_headers=["*"])],
+)

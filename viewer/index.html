@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>RedSpark viewer</title>
+    <style>html,body{background:#15171c;height:100%;margin:0;font-family:system-ui,sans-serif;overflow:hidden}#panel{color:#e8e8ea;background:#14161ce0;border:1px solid #2c3038;border-radius:8px;width:260px;padding:12px 14px;font-size:13px;line-height:1.5;position:absolute;top:12px;left:12px}#panel h1{margin:0 0 8px;font-size:15px}#panel select,#panel button{font:inherit;margin:2px 0}#panel select{width:100%}#panel .row{gap:6px;margin:6px 0;display:flex}#panel .row button{flex:1}#panel .muted{color:#9aa0aa}#status.error{color:#ff7b72}</style>
+    <script type="module" crossorigin src="./assets/index.js"></script>
+  </head>
+  <body>
+    <div id="panel">
+      <h1>RedSpark</h1>
+      <select id="circuit"></select>
+      <div class="row">
+        <button id="play">Play</button>
+        <button id="step">Step</button>
+        <button id="reset">Reset</button>
+      </div>
+      <label>Speed <input id="tps" type="range" min="1" max="30" value="10" /> <span id="tpsLabel">10</span> ticks/s</label>
+      <div>Tick <span id="ticks">0</span></div>
+      <div class="muted">Click a lever to flip it. Drag to orbit, scroll to zoom.</div>
+      <div id="status" class="muted">Connecting...</div>
+    </div>
+  </body>
+</html>
