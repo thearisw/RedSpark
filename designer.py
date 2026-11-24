@@ -247,13 +247,26 @@ class Policy:
 
 
 # ---------------------------------------------------------------- training
+def bounding_dims(c: Circuit) -> list[int]:
+    """Width, height and depth of the box around every block in the circuit."""
+    idx = np.argwhere(c.block != Block.AIR)
+    if len(idx) == 0:
+        return [0, 0, 0]
+    return [int(v) for v in idx.max(axis=0) - idx.min(axis=0) + 1]
+
+
 @dataclass
 class Individual:
     theta: np.ndarray
-    fitness: float = float("-inf")
+    fitness: tuple = ()
     circuit: Circuit | None = None
     result: Evaluation | None = None
     blocks: int = 0
+    volume: int = 0             # bounding box of every block, inputs and outputs included
+
+    @property
+    def dims(self) -> list[int]:
+        return bounding_dims(self.circuit) if self.circuit is not None else [0, 0, 0]
 
 
 @dataclass
@@ -267,7 +280,7 @@ class GenerationStats:
 
     def to_dict(self) -> dict:
         return {"gen": self.gen, "best": self.best_rows, "mean": round(self.mean_rows, 3),
-                "solved": self.solved, "new_best": self.new_best}
+                "solved": self.solved, "new_best": self.new_best, "blocks": self.best.blocks}
 
 
 class Trainer:
@@ -303,22 +316,31 @@ class Trainer:
             c.place(pos, kind, facing=facing)
         return c
 
-    def fitness(self, c: Circuit) -> tuple[float, Evaluation, int]:
+    def fitness(self, c: Circuit) -> tuple[tuple, Evaluation, int, int]:
+        """A ranking key, compared element by element (bigger is better).
+
+        Correctness always comes first: rows passed. Among circuits that pass
+        every row, fewer blocks wins, then the smaller bounding box. Circuits
+        that are not correct yet are ranked by hints instead (output bits right,
+        how close an input-driven signal gets to the outputs), so a small but
+        wrong circuit never beats a correct one.
+        """
         res = evaluate(c, self.task)
         blocks = c.count_blocks() - len(self.task.fixed)
+        volume = int(np.prod(bounding_dims(c)))
+        if res.rows_passed == self.n_rows:
+            return (res.rows_passed, 1, -blocks, -volume), res, blocks, volume
         bits = [(e == g) for row, got in zip(self.task.rows, res.got)
                 for e, g in zip(row.outputs, got) if e is not None]
         bit_frac = sum(bits) / max(1, len(bits))
         # An output that reacts to the inputs at all is a step away from "always off".
         reach = float(np.mean(res.reach))
-        score = res.rows_passed + 0.5 * bit_frac + 0.3 * reach - 0.005 * blocks
-        if not res.stable:
-            score -= 0.5
-        return score, res, blocks
+        hint = 0.5 * bit_frac + 0.3 * reach - (0.5 if not res.stable else 0.0)
+        return (res.rows_passed, 0, hint, -blocks), res, blocks, volume
 
     def score(self, ind: Individual) -> None:
         ind.circuit = self.build(ind.theta)
-        ind.fitness, ind.result, ind.blocks = self.fitness(ind.circuit)
+        ind.fitness, ind.result, ind.blocks, ind.volume = self.fitness(ind.circuit)
 
     def generation(self) -> GenerationStats:
         for ind in self.pop:

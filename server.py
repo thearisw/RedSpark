@@ -27,9 +27,9 @@ client -> server
 
 server -> client
     {"type": "state", "name": ..., "circuit": {size, ticks, blocks: [...]}}
-    {"type": "train_progress", "running", "gen", "rows_total", "stats": [{gen, best, mean, solved, new_best}],
-       "best_ever": {gen, rows}}             stats for every generation since the last message
-    {"type": "train_circuit", "gen", "kind", "rows_passed", "rows_total", "passed", "got", "blocks",
+    {"type": "train_progress", "running", "gen", "rows_total", "stats": [{gen, best, mean, solved, new_best, blocks}],
+       "best_ever": {gen, rows, blocks, dims}}             stats for every generation since the last message
+    {"type": "train_circuit", "gen", "kind", "rows_passed", "rows_total", "passed", "got", "blocks", "dims",
        "frames": [circuit per truth-table row]}   at most render_hz per second
     {"type": "saved", "name": ...}
     {"type": "error", "message": ...}
@@ -209,7 +209,8 @@ class Training:
         await self.session.send({
             "type": "train_progress", "running": self.running, "gen": t.gen if t else 0,
             "rows_total": t.n_rows if t else 0, "stats": stats,
-            "best_ever": {"gen": t.best_gen, "rows": t.best.result.rows_passed} if t and t.best else None,
+            "best_ever": {"gen": t.best_gen, "rows": t.best.result.rows_passed, "blocks": t.best.blocks,
+                          "dims": t.best.dims} if t and t.best else None,
         })
 
     async def send_circuit(self, ind, gen: int, kind: str) -> None:
@@ -217,7 +218,7 @@ class Training:
         await self.session.send({
             "type": "train_circuit", "gen": gen, "kind": kind, "rows_passed": res.rows_passed,
             "rows_total": len(res.passed), "passed": res.passed, "got": res.got,
-            "blocks": ind.blocks, "frames": res.frames,
+            "blocks": ind.blocks, "dims": ind.dims, "frames": res.frames,
         })
 
     def wanted(self, stats) -> bool:
