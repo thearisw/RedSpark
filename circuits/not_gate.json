@@ -1,0 +1,55 @@
+{
+ "size": [
+  5,
+  1,
+  3
+ ],
+ "ticks": 0,
+ "blocks": [
+  {
+   "pos": [
+    0,
+    0,
+    1
+   ],
+   "type": "lever",
+   "facing": "+x",
+   "on": false,
+   "label": "A"
+  },
+  {
+   "pos": [
+    1,
+    0,
+    1
+   ],
+   "type": "solid"
+  },
+  {
+   "pos": [
+    2,
+    0,
+    1
+   ],
+   "type": "torch",
+   "facing": "-x"
+  },
+  {
+   "pos": [
+    3,
+    0,
+    1
+   ],
+   "type": "dust"
+  },
+  {
+   "pos": [
+    4,
+    0,
+    1
+   ],
+   "type": "lamp",
+   "label": "OUT"
+  }
+ ]
+}

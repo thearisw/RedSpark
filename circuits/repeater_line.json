@@ -1,0 +1,66 @@
+{
+ "size": [
+  6,
+  1,
+  1
+ ],
+ "ticks": 0,
+ "blocks": [
+  {
+   "pos": [
+    0,
+    0,
+    0
+   ],
+   "type": "lever",
+   "facing": "-y",
+   "on": false,
+   "label": "A"
+  },
+  {
+   "pos": [
+    1,
+    0,
+    0
+   ],
+   "type": "dust"
+  },
+  {
+   "pos": [
+    2,
+    0,
+    0
+   ],
+   "type": "repeater",
+   "facing": "+x",
+   "delay": 2
+  },
+  {
+   "pos": [
+    3,
+    0,
+    0
+   ],
+   "type": "repeater",
+   "facing": "+x",
+   "delay": 3
+  },
+  {
+   "pos": [
+    4,
+    0,
+    0
+   ],
+   "type": "dust"
+  },
+  {
+   "pos": [
+    5,
+    0,
+    0
+   ],
+   "type": "lamp",
+   "label": "OUT"
+  }
+ ]
+}

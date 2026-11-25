@@ -1,0 +1,91 @@
+{
+ "size": [
+  7,
+  1,
+  3
+ ],
+ "ticks": 0,
+ "blocks": [
+  {
+   "pos": [
+    0,
+    0,
+    2
+   ],
+   "type": "lever",
+   "facing": "-y",
+   "on": false,
+   "label": "A"
+  },
+  {
+   "pos": [
+    1,
+    0,
+    2
+   ],
+   "type": "dust"
+  },
+  {
+   "pos": [
+    2,
+    0,
+    2
+   ],
+   "type": "dust"
+  },
+  {
+   "pos": [
+    3,
+    0,
+    2
+   ],
+   "type": "dust"
+  },
+  {
+   "pos": [
+    4,
+    0,
+    0
+   ],
+   "type": "lever",
+   "facing": "-y",
+   "on": false,
+   "label": "B"
+  },
+  {
+   "pos": [
+    4,
+    0,
+    1
+   ],
+   "type": "dust"
+  },
+  {
+   "pos": [
+    4,
+    0,
+    2
+   ],
+   "type": "comparator",
+   "facing": "+x",
+   "mode": "compare"
+  },
+  {
+   "pos": [
+    5,
+    0,
+    2
+   ],
+   "type": "dust"
+  },
+  {
+   "pos": [
+    6,
+    0,
+    2
+   ],
+   "type": "lamp",
+   "label": "OUT"
+  }
+ ]
+}
