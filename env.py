@@ -23,6 +23,7 @@ PLACEABLE: list[tuple[Block, int]] = (
     + [(Block.TORCH, d) for d in HORIZONTAL + [DOWN]]
     + [(Block.REPEATER, d) for d in HORIZONTAL]
 )
+COMPARATOR_CHOICES: list[tuple[Block, int]] = [(Block.COMPARATOR, d) for d in HORIZONTAL]
 N_BLOCK_TYPES = len(Block)
 
 
@@ -45,7 +46,8 @@ class RedstoneGateEnv(gym.Env):
 
     def __init__(self, gate: str = "NOT", size: tuple[int, int, int] | None = None,
                  max_steps: int = 16, block_cost: float = 0.01, solve_bonus: float = 1.0,
-                 invalid_penalty: float = 0.02, render_mode: str | None = None):
+                 invalid_penalty: float = 0.02, render_mode: str | None = None,
+                 allow_comparators: bool = False):
         if gate not in GATES:
             raise ValueError(f"unknown gate {gate}; choose from {sorted(GATES)}")
         self.gate = gate
@@ -55,11 +57,13 @@ class RedstoneGateEnv(gym.Env):
         self.solve_bonus = solve_bonus
         self.invalid_penalty = invalid_penalty
         self.render_mode = render_mode
+        # Comparators are opt-in so existing runs keep the same action space.
+        self.placeable = PLACEABLE + (COMPARATOR_CHOICES if allow_comparators else [])
         self.inputs, self.output = io_layout(gate, self.size)
         self.fixed = set(self.inputs.values()) | {self.output}
 
         self.n_cells = int(np.prod(self.size))
-        self.action_space = spaces.Discrete(self.n_cells * len(PLACEABLE))
+        self.action_space = spaces.Discrete(self.n_cells * len(self.placeable))
         # Channels: block one-hot, facing one-hot, fixed-cell mask.
         self.obs_shape = (N_BLOCK_TYPES + 6 + 1, *self.size)
         self.observation_space = spaces.Box(0.0, 1.0, shape=(int(np.prod(self.obs_shape)),), dtype=np.float32)
@@ -78,7 +82,7 @@ class RedstoneGateEnv(gym.Env):
         obs = np.zeros(self.obs_shape, dtype=np.float32)
         for k in range(N_BLOCK_TYPES):
             obs[k] = c.block == k
-        has_facing = (c.block == Block.TORCH) | (c.block == Block.REPEATER) | (c.block == Block.LEVER)
+        has_facing = np.isin(c.block, [Block.TORCH, Block.REPEATER, Block.LEVER, Block.COMPARATOR])
         for d in range(6):
             obs[N_BLOCK_TYPES + d] = has_facing & (c.facing == d)
         for p in self.fixed:
@@ -86,9 +90,9 @@ class RedstoneGateEnv(gym.Env):
         return obs.ravel()
 
     def decode(self, action: int) -> tuple[tuple[int, int, int], Block, int]:
-        cell, choice = divmod(int(action), len(PLACEABLE))
+        cell, choice = divmod(int(action), len(self.placeable))
         pos = tuple(int(i) for i in np.unravel_index(cell, self.size))
-        kind, facing = PLACEABLE[choice]
+        kind, facing = self.placeable[choice]
         return pos, kind, facing
 
     def _valid(self, pos, kind: Block, facing: int) -> bool:
@@ -99,8 +103,8 @@ class RedstoneGateEnv(gym.Env):
         if current == kind and (kind not in (Block.TORCH, Block.REPEATER) or c.facing[pos] == facing):
             return False  # would change nothing
         if kind == Block.TORCH:
-            return c.get(add(pos, facing)) == Block.SOLID
-        if kind in (Block.DUST, Block.REPEATER) and pos[1] > 0:
+            return c.can_support_torch(pos, facing)  # solid blocks and lamps (see sim.py)
+        if kind in (Block.DUST, Block.REPEATER, Block.COMPARATOR) and pos[1] > 0:
             return c.is_conductor(add(pos, DOWN))  # needs a block underneath (y=0 sits on the floor)
         return True
 
@@ -149,7 +153,8 @@ class RedstoneGateEnv(gym.Env):
     def render(self):
         """Top-down text view of the y=0 layer."""
         chars = {Block.AIR: ".", Block.SOLID: "#", Block.DUST: "+", Block.TORCH: "i",
-                 Block.REPEATER: ">", Block.LEVER: "L", Block.LAMP: "O"}
+                 Block.REPEATER: ">", Block.LEVER: "L", Block.LAMP: "O",
+                 Block.COMPARATOR: "C"}
         c = self.circuit
         lines = ["".join(chars[Block(c.block[x, 0, z])] for x in range(self.size[0]))
                  for z in range(self.size[2])]

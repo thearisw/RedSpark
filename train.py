@@ -40,9 +40,10 @@ def main() -> None:
     parser.add_argument("--envs", type=int, default=8)
     parser.add_argument("--max-steps", type=int, default=16)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--comparators", action="store_true", help="let the agent place comparators")
     args = parser.parse_args()
 
-    env_kwargs = {"gate": args.gate, "max_steps": args.max_steps}
+    env_kwargs = {"gate": args.gate, "max_steps": args.max_steps, "allow_comparators": args.comparators}
     vec_env = make_vec_env(RedstoneGateEnv, n_envs=args.envs, seed=args.seed, env_kwargs=env_kwargs)
     # MaskablePPO is PPO that only samples legal moves (see RedstoneGateEnv.action_masks).
     model = MaskablePPO("MlpPolicy", vec_env, n_steps=256, batch_size=256, ent_coef=0.02,

@@ -13,7 +13,8 @@ What happens inside one game tick (``Circuit.step``)
     2. **Scheduled tile ticks** that are due run in order of (due time,
        priority, scheduling order). Priority: lower runs first. Repeaters use
        -3 when facing into another diode that does not face back, -2 when
-       turning off and -1 when turning on. Everything else uses 0.
+       turning off and -1 when turning on. Comparators use -1 when facing into
+       another diode that does not face back, else 0. Everything else uses 0.
     3. Block events and block entities (pistons, hoppers...) would run here.
        None of the current components use them.
 
@@ -31,7 +32,10 @@ How changes spread
 Components
     * **Lever**: attached to a block face. Weak power 15 to all neighbours and
       strong power into the block it is attached to.
-    * **Torch**: attached below or beside. Weak power 15 to all neighbours except
+    * **Torch**: attached below or beside. Only blocks in
+      ``SUPPORTS_WALL_TORCH`` / ``SUPPORTS_STANDING_TORCH`` (solid blocks and
+      lamps) can hold one, plus the floor for standing torches. A torch whose
+      support is removed breaks off. Weak power 15 to all neighbours except
       its attachment block, and strong power into the block above. It turns off
       2 gt after its attachment block is powered. 8 toggles within 60 gt burn
       it out, and it rechecks 160 gt later.
@@ -45,6 +49,14 @@ Components
       through. When its level changes, it block-updates around itself and every
       neighbour (7 positions, 42 updates). Java iterates those positions in hash
       order ("locational" behaviour); this simulator uses a fixed order.
+    * **Comparator**: reads the block behind it (dust by its level) and the
+      strongest *side* input. Only dust (by level) and the direct output of
+      levers, torches, repeaters and comparators count as side inputs; plain
+      blocks do not. Compare mode outputs the rear signal unless a side is
+      stronger. Subtract mode outputs rear minus side. It updates 2 gt after
+      its inputs change. Like a repeater it strongly powers the block in front,
+      but at its output strength. ``comparator_update`` is the hook containers
+      will call when their contents change.
     * **Lamp**: turns on as soon as it is powered and off 4 gt after power is lost.
       It is a conductor.
     * **Solid block**: a conductor. It is *strongly* powered by direct
@@ -59,8 +71,8 @@ Quasi-connectivity
     can be "budded" (quasi-powered without noticing) exactly as in Java.
 
 Simplifications: dust and repeaters do not need a block underneath (the grid
-floor counts as support), and there are no observers, comparators or pistons
-yet. Coordinates are ``(x, y, z)`` with ``y`` up, +x = east and +z = south.
+floor counts as support), and there are no observers or pistons
+yet, nor containers for comparators to read. Coordinates are ``(x, y, z)`` with ``y`` up, +x = east and +z = south.
 """
 
 from __future__ import annotations
@@ -81,6 +93,10 @@ class Block(IntEnum):
     REPEATER = 4
     LEVER = 5
     LAMP = 6
+    COMPARATOR = 7
+
+
+DIODES = (Block.REPEATER, Block.COMPARATOR)
 
 
 # Direction indices: 0:+x(east) 1:-x(west) 2:+z(south) 3:-z(north) 4:+y(up) 5:-y(down)
@@ -96,6 +112,7 @@ VALUES_ORDER = [DOWN, UP, NORTH, SOUTH, WEST, EAST]
 
 # Delays in game ticks.
 TORCH_DELAY = 2
+COMPARATOR_DELAY = 2
 LAMP_OFF_DELAY = 4
 BURNOUT_TOGGLES, BURNOUT_WINDOW, BURNOUT_RECOVER = 8, 60, 160
 
@@ -103,6 +120,12 @@ BURNOUT_TOGGLES, BURNOUT_WINDOW, BURNOUT_RECOVER = 8, 60, 160
 EXTREMELY_HIGH, VERY_HIGH, HIGH, NORMAL = -3, -2, -1, 0
 
 CONDUCTORS = (Block.SOLID, Block.LAMP)
+
+# Placement support, kept as data so new blocks only need adding here.
+# A wall torch hangs on the side of one of these; a standing torch sits on top of one.
+SUPPORTS_WALL_TORCH = frozenset({Block.SOLID, Block.LAMP})
+SUPPORTS_STANDING_TORCH = frozenset({Block.SOLID, Block.LAMP})
+FLOOR_SUPPORTS_STANDING_TORCH = True  # the floor under y = 0 counts as a block
 
 Pos = tuple[int, int, int]
 
@@ -124,12 +147,14 @@ class Circuit:
         self.size = tuple(int(s) for s in size)
         self.block = np.zeros(self.size, dtype=np.int8)
         # TORCH / LEVER: direction towards the block it is attached to.
-        # REPEATER: direction it outputs to (horizontal only).
+        # REPEATER / COMPARATOR: direction it outputs to (horizontal only).
         self.facing = np.zeros(self.size, dtype=np.int8)
         self.delay = np.ones(self.size, dtype=np.int8)       # repeater delay in redstone ticks
         self.state = np.zeros(self.size, dtype=bool)          # lever on, torch lit, repeater/lamp powered
         self.dust = np.zeros(self.size, dtype=np.int8)        # dust power level
         self.locked = np.zeros(self.size, dtype=bool)         # repeater locked
+        self.output = np.zeros(self.size, dtype=np.int8)      # comparator output strength
+        self.subtract = np.zeros(self.size, dtype=bool)       # comparator in subtract mode
         self.labels: dict[str, Pos] = {}
         self.ticks = 0                                        # game time
         self._queue: list[tuple[int, int, int, Pos]] = []     # (due, priority, order, pos)
@@ -152,7 +177,7 @@ class Circuit:
 
     def copy(self) -> "Circuit":
         clone = copy.copy(self)
-        for name in ("block", "facing", "delay", "state", "dust", "locked"):
+        for name in ("block", "facing", "delay", "state", "dust", "locked", "output", "subtract"):
             setattr(clone, name, getattr(self, name).copy())
         clone.labels = dict(self.labels)
         clone._queue = list(self._queue)
@@ -180,6 +205,8 @@ class Circuit:
             return 0 if toward == add(p, int(self.facing[p])) else 15
         if kind == Block.REPEATER:
             return 15 if self.state[p] and toward == add(p, int(self.facing[p])) else 0
+        if kind == Block.COMPARATOR:
+            return int(self.output[p]) if toward == add(p, int(self.facing[p])) else 0
         if kind == Block.DUST:
             if not dust_signals or self.dust[p] == 0:
                 return 0
@@ -235,7 +262,7 @@ class Circuit:
             return True
         if kind in (Block.LEVER, Block.TORCH):
             return True
-        if kind == Block.REPEATER:
+        if kind in DIODES:
             return int(self.facing[q]) in (d, OPPOSITE[d])
         above, below = add(q, UP), add(q, DOWN)
         if self.get(above) == Block.DUST and not self.is_conductor(add(p, UP)):
@@ -322,13 +349,19 @@ class Circuit:
             if not self.locked[p]:
                 should = self._repeater_input(p) > 0
                 if bool(self.state[p]) != should and not self.has_scheduled_tick(p):
-                    if self._repeater_prioritized(p):
+                    if self._diode_prioritized(p):
                         priority = EXTREMELY_HIGH
                     elif self.state[p]:
                         priority = VERY_HIGH
                     else:
                         priority = HIGH
                     self.schedule(p, 2 * int(self.delay[p]), priority)
+        elif kind == Block.COMPARATOR:
+            if not self.has_scheduled_tick(p):
+                if (self._comparator_output(p) != self.output[p]
+                        or bool(self.state[p]) != self._comparator_should_power(p)):
+                    priority = HIGH if self._diode_prioritized(p) else NORMAL
+                    self.schedule(p, COMPARATOR_DELAY, priority)
         elif kind == Block.LAMP:
             powered = self.has_neighbor_signal(p)
             if self.state[p] and not powered:
@@ -357,6 +390,8 @@ class Circuit:
                 self._set_state(p, True)
                 if not should:  # extend short pulses to the full delay
                     self.schedule(p, 2 * int(self.delay[p]), VERY_HIGH)
+        elif kind == Block.COMPARATOR:
+            self._comparator_refresh(p)
         elif kind == Block.LAMP:
             if self.state[p] and not self.has_neighbor_signal(p):
                 self._set_state(p, False)
@@ -376,11 +411,74 @@ class Circuit:
         return sum(self.ticks - t < BURNOUT_WINDOW for t in self._burnout.get(p, [])) >= BURNOUT_TOGGLES
 
     def _repeater_input(self, p: Pos) -> int:
+        """Rear input of a diode: the signal from behind, with dust counted by its level."""
         back = add(p, OPPOSITE[int(self.facing[p])])
         s = self.signal(back, p)
         if s < 15 and self.get(back) == Block.DUST:
             s = max(s, int(self.dust[back]))
         return s
+
+    def _side_input_at(self, p: Pos, side: int) -> int:
+        q = add(p, side)
+        kind = self.get(q)
+        if kind == Block.DUST:
+            return int(self.dust[q])
+        if kind in (Block.LEVER, Block.TORCH, Block.REPEATER, Block.COMPARATOR):
+            return self._emitted(q, p, True, True)  # signal sources count only with direct power
+        return 0
+
+    def _comparator_side(self, p: Pos) -> int:
+        f = int(self.facing[p])
+        return max(self._side_input_at(p, d) for d in HORIZONTAL if d not in (f, OPPOSITE[f]))
+
+    def _comparator_output(self, p: Pos) -> int:
+        rear = self._repeater_input(p)
+        if rear == 0:
+            return 0
+        side = self._comparator_side(p)
+        if side > rear:
+            return 0
+        return rear - side if self.subtract[p] else rear
+
+    def _comparator_should_power(self, p: Pos) -> bool:
+        rear = self._repeater_input(p)
+        if rear == 0:
+            return False
+        side = self._comparator_side(p)
+        return rear > side or (rear == side and not self.subtract[p])
+
+    def _comparator_refresh(self, p: Pos) -> None:
+        out = self._comparator_output(p)
+        old = int(self.output[p])
+        self.output[p] = out
+        if old != out or not self.subtract[p]:
+            self.state[p] = self._comparator_should_power(p)
+            self._shape_updates(p)
+            self._update_front(p)
+
+    def comparator_update(self, p: Pos) -> None:
+        """Notify comparators reading ``p`` directly or through one block.
+
+        Containers will call this when their contents change, as in Java.
+        """
+        for d in HORIZONTAL:
+            q = add(p, d)
+            if self.get(q) == Block.COMPARATOR:
+                self.neighbor_changed(q, p)
+            elif self.is_conductor(q):
+                r = add(q, d)
+                if self.get(r) == Block.COMPARATOR and add(r, OPPOSITE[int(self.facing[r])]) == q:
+                    self.neighbor_changed(r, q)
+
+    def _update_front(self, p: Pos) -> None:
+        """A diode updates only the block in front of it and that block's neighbours."""
+        front = add(p, int(self.facing[p]))
+        if self.in_bounds(front):
+            self.neighbor_changed(front, p)
+        for d in UPDATE_ORDER:
+            q = add(front, d)
+            if q != p and self.in_bounds(q):
+                self.neighbor_changed(q, front)
 
     def _repeater_locked(self, p: Pos) -> bool:
         f = int(self.facing[p])
@@ -388,14 +486,16 @@ class Circuit:
             if side in (f, OPPOSITE[f]):
                 continue
             q = add(p, side)
-            if self.get(q) == Block.REPEATER and int(self.facing[q]) == OPPOSITE[side] and self.state[q]:
+            if (self.get(q) in DIODES and int(self.facing[q]) == OPPOSITE[side]
+                    and self._emitted(q, p, True, True) > 0):
                 return True
         return False
 
-    def _repeater_prioritized(self, p: Pos) -> bool:
+    def _diode_prioritized(self, p: Pos) -> bool:
+        """Facing into another diode that does not face back at this one."""
         f = int(self.facing[p])
         front = add(p, f)
-        return self.get(front) == Block.REPEATER and int(self.facing[front]) != OPPOSITE[f]
+        return self.get(front) in DIODES and int(self.facing[front]) != OPPOSITE[f]
 
     def _set_state(self, p: Pos, on: bool) -> None:
         """Change a component's on/off state and send the updates Java would."""
@@ -409,13 +509,7 @@ class Circuit:
                 self.update_neighbors_at(add(p, d))
             self.update_neighbors_at(p)
         elif kind == Block.REPEATER:        # only the block in front and its neighbours
-            front = add(p, int(self.facing[p]))
-            if self.in_bounds(front):
-                self.neighbor_changed(front, p)
-            for d in UPDATE_ORDER:
-                q = add(front, d)
-                if q != p and self.in_bounds(q):
-                    self.neighbor_changed(q, front)
+            self._update_front(p)
         elif kind == Block.LEVER:
             self.update_neighbors_at(p)
             self.update_neighbors_at(add(p, int(self.facing[p])))
@@ -423,7 +517,7 @@ class Circuit:
 
     # ----------------------------------------------------------------- editing
     def place(self, p: Pos, kind: Block, facing: int | None = None, delay: int = 1,
-              on: bool = False, label: str | None = None) -> None:
+              on: bool = False, label: str | None = None, subtract: bool = False) -> None:
         """Place (or with AIR, remove) a block and let the circuit react."""
         p = tuple(int(v) for v in p)
         if not self.in_bounds(p):
@@ -431,21 +525,24 @@ class Circuit:
         kind = Block(kind)
         if facing is None:
             facing = DOWN if kind in (Block.TORCH, Block.LEVER) else EAST
-        if kind == Block.TORCH and facing == UP:
-            raise ValueError("a torch cannot hang from the block above it")
-        if kind == Block.REPEATER and facing not in HORIZONTAL:
-            raise ValueError("a repeater must face horizontally")
+        if kind == Block.TORCH and not self.can_support_torch(p, facing):
+            raise ValueError(f"a torch at {p} needs a solid block or lamp to attach to "
+                             f"(towards {FACING_NAMES[facing]})")
+        if kind in DIODES and facing not in HORIZONTAL:
+            raise ValueError(f"a {kind.name.lower()} must face horizontally")
         if not 1 <= delay <= 4:
             raise ValueError("repeater delay must be 1..4")
 
         old = self.get(p)
-        old_state = (int(self.facing[p]), bool(self.state[p]))
+        old_state = (int(self.facing[p]), bool(self.state[p]) or bool(self.output[p]))
         self.block[p] = kind
         self.facing[p] = facing
         self.delay[p] = delay
         self.state[p] = True if kind == Block.TORCH else (on if kind == Block.LEVER else False)
         self.dust[p] = 0
         self.locked[p] = False
+        self.output[p] = 0
+        self.subtract[p] = subtract if kind == Block.COMPARATOR else False
         self._scheduled.pop(p, None)  # a stale tick is ignored when it comes up
         for name, q in list(self.labels.items()):
             if q == p:
@@ -462,10 +559,40 @@ class Circuit:
             self.update_neighbors_at(add(p, old_state[0]))
         if kind == Block.LEVER:
             self.update_neighbors_at(add(p, facing))
-        if old == Block.REPEATER and old_state[1]:
+        if old in DIODES and old_state[1]:
             self.update_neighbors_at(add(p, old_state[0]))
         self.update_neighbors_at(p)
         self.neighbor_changed(p, p)  # the new block checks its own inputs
+        if kind not in SUPPORTS_WALL_TORCH | SUPPORTS_STANDING_TORCH:
+            self._drop_unsupported_torches(p)
+
+    def can_support_torch(self, p: Pos, facing: int) -> bool:
+        """Whether a torch at ``p`` attached towards ``facing`` has something to hang on."""
+        if facing == UP:
+            return False
+        support = add(p, facing)
+        if facing == DOWN:
+            if support[1] < 0:
+                return FLOOR_SUPPORTS_STANDING_TORCH
+            return self.get(support) in SUPPORTS_STANDING_TORCH
+        return self.get(support) in SUPPORTS_WALL_TORCH
+
+    def can_place(self, p: Pos, kind: Block, facing: int | None = None) -> bool:
+        """Placement rules that the simulator enforces (training masks should use this)."""
+        p = tuple(int(v) for v in p)
+        if not self.in_bounds(p):
+            return False
+        if kind == Block.TORCH:
+            return self.can_support_torch(p, DOWN if facing is None else facing)
+        return True
+
+    def _drop_unsupported_torches(self, p: Pos) -> None:
+        """Torches next to ``p`` that lost their support break off, as in Java."""
+        for d in VALUES_ORDER:
+            q = add(p, d)
+            if self.get(q) == Block.TORCH and add(q, int(self.facing[q])) == p \
+                    and not self.can_support_torch(q, int(self.facing[q])):
+                self.place(q, Block.AIR)
 
     def remove(self, p: Pos) -> None:
         self.place(p, Block.AIR)
@@ -478,6 +605,15 @@ class Circuit:
 
     def toggle(self, p: Pos) -> None:
         self.set_lever(p, not self.state[tuple(p)])
+
+    def set_comparator_mode(self, p: Pos, subtract: bool) -> None:
+        """Switch a comparator between compare and subtract mode (takes effect at once)."""
+        p = tuple(p)
+        if self.get(p) != Block.COMPARATOR:
+            raise ValueError(f"no comparator at {p}")
+        if bool(self.subtract[p]) != subtract:
+            self.subtract[p] = subtract
+            self._comparator_refresh(p)
 
     # -------------------------------------------------------------- simulation
     def step(self, n: int = 1) -> None:
@@ -512,12 +648,14 @@ class Circuit:
             p = tuple(int(i) for i in idx)
             kind = Block(int(self.block[p]))
             entry: dict = {"pos": list(p), "type": kind.name.lower()}
-            if kind in (Block.TORCH, Block.REPEATER, Block.LEVER):
+            if kind in (Block.TORCH, Block.REPEATER, Block.LEVER, Block.COMPARATOR):
                 entry["facing"] = FACING_NAMES[int(self.facing[p])]
             if kind == Block.REPEATER:
                 entry["delay"] = int(self.delay[p])
             if kind == Block.LEVER:
                 entry["on"] = bool(self.state[p])
+            if kind == Block.COMPARATOR:
+                entry["mode"] = "subtract" if self.subtract[p] else "compare"
             label = next((n for n, q in self.labels.items() if q == p), None)
             if label:
                 entry["label"] = label
@@ -528,6 +666,8 @@ class Circuit:
                     entry["shape"] = self.dust_shape(p)
                 if kind == Block.REPEATER and self.locked[p]:
                     entry["locked"] = True
+                if kind == Block.COMPARATOR:
+                    entry["output"] = int(self.output[p])
             blocks.append(entry)
         return {"size": list(self.size), "ticks": self.ticks, "blocks": blocks}
 
@@ -538,7 +678,8 @@ class Circuit:
             kind = Block[b["type"].upper()]
             facing = FACING_NAMES.index(b["facing"]) if "facing" in b else None
             c.place(tuple(b["pos"]), kind, facing=facing, delay=b.get("delay", 1),
-                    on=b.get("on", False), label=b.get("label"))
+                    on=b.get("on", False), label=b.get("label"),
+                    subtract=b.get("mode") == "subtract")
         if settle:
             c.settle()
         return c

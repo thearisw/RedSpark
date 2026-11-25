@@ -113,9 +113,13 @@ class Session:
             raise ValueError("load a circuit first")
         elif kind == "toggle":
             pos = tuple(int(v) for v in msg["pos"])
-            if self.circuit.get(pos) != Block.LEVER:
-                raise ValueError("only levers can be toggled")
-            self.circuit.toggle(pos)
+            kind = self.circuit.get(pos)
+            if kind == Block.LEVER:
+                self.circuit.toggle(pos)
+            elif kind == Block.COMPARATOR:  # clicking a comparator switches its mode
+                self.circuit.set_comparator_mode(pos, not self.circuit.subtract[pos])
+            else:
+                raise ValueError("only levers and comparators can be clicked")
         elif kind == "step":
             self.circuit.step()
         elif kind == "play":
@@ -221,6 +225,12 @@ class Training:
             "blocks": ind.blocks, "dims": ind.dims, "frames": res.frames,
         })
 
+    def shown(self, stats):
+        """Which network to draw: in "every generation" mode the best of that
+        generation's new networks (the kept elites would repeat the same design),
+        otherwise the generation's best."""
+        return stats.newest if self.show == "all" else stats.best
+
     def wanted(self, stats) -> bool:
         if self.show == "all":
             return True
@@ -241,7 +251,7 @@ class Training:
                 candidate = stats
             now = time.monotonic()
             if candidate is not None and now - last_circuit >= 1.0 / self.render_hz:
-                await self.send_circuit(candidate.best, candidate.gen, self.show)
+                await self.send_circuit(self.shown(candidate), candidate.gen, self.show)
                 candidate, last_circuit = None, now
             if now - last_stats >= 0.1:
                 await self.send_progress(pending)
@@ -252,7 +262,7 @@ class Training:
             except asyncio.TimeoutError:
                 pass
         if candidate is not None:
-            await self.send_circuit(candidate.best, candidate.gen, self.show)
+            await self.send_circuit(self.shown(candidate), candidate.gen, self.show)
         await self.send_progress(pending)
 
 

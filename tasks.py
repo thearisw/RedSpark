@@ -16,6 +16,7 @@ GATES: dict[str, tuple[int, Callable[..., bool]]] = {
     "NAND": (2, lambda a, b: not (a and b)),
     "NOR": (2, lambda a, b: not (a or b)),
     "XOR": (2, lambda a, b: a != b),
+    "ANDNOT": (2, lambda a, b: a and not b),  # A and not B
 }
 
 

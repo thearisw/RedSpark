@@ -19,7 +19,14 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
+from . import sim
 from .sim import DOWN, HORIZONTAL, Block, Circuit, DIRS
+
+# Which blocks a torch can hang on (wall) or stand on, as the simulator defines them.
+# Older simulators without these constants only allowed solid blocks.
+WALL_SUPPORT = tuple(int(k) for k in getattr(sim, "SUPPORTS_WALL_TORCH", (Block.SOLID,)))
+STANDING_SUPPORT = tuple(int(k) for k in getattr(sim, "SUPPORTS_STANDING_TORCH", (Block.SOLID,)))
+FLOOR_SUPPORT = bool(getattr(sim, "FLOOR_SUPPORTS_STANDING_TORCH", False))
 
 # (block, facing) choices a network can place. AIR clears a cell.
 PLACEABLE: list[tuple[Block, int]] = (
@@ -103,6 +110,7 @@ class Evaluation:
     stable: bool
     frames: list[dict] = field(default_factory=list)  # settled state per row (if asked)
     reach: list[float] = field(default_factory=list)  # per output: how close input-driven signal gets (0..1)
+    match: list[float] = field(default_factory=list)  # per output: how close the *right* signal gets (0..1)
 
     @property
     def rows_passed(self) -> int:
@@ -130,7 +138,8 @@ def evaluate(circuit: Circuit, task: TruthTableTask, settle_ticks: int | None = 
         active_maps.append(active_cells(c))
         if frames:
             shots.append(c.to_dict())
-    return Evaluation(passed, got, stable, shots, signal_reach(task, active_maps))
+    return Evaluation(passed, got, stable, shots, signal_reach(task, active_maps),
+                      matching_reach(task, active_maps))
 
 
 def active_cells(c: Circuit) -> np.ndarray:
@@ -158,6 +167,32 @@ def signal_reach(task: TruthTableTask, active_maps: list[np.ndarray]) -> list[fl
             out.append(0.0)
             continue
         d = np.abs(driven - np.array(p)).sum(axis=1).min()
+        out.append(max(0.0, 1.0 - d / span))
+    return out
+
+
+def matching_reach(task: TruthTableTask, active_maps: list[np.ndarray]) -> list[float]:
+    """For each output, 1 - (distance from the nearest cell that already has the wanted signal) / span.
+
+    A cell has the wanted signal if it is on exactly in the rows where the output
+    should be on (ignoring don't-care rows). For "OUT = B" the B lever itself
+    qualifies, so a dust line growing from B towards the lamp scores better at
+    every step, even while a wrong path (say from A) already reaches the lamp.
+    """
+    stack = np.stack(active_maps)
+    span = float(sum(task.size))
+    out = []
+    for k, p in enumerate(task.outputs.values()):
+        rows = [i for i, r in enumerate(task.rows) if r.outputs[k] is not None]
+        want = np.array([task.rows[i].outputs[k] for i in rows], dtype=bool)
+        if not rows or want.all() or not want.any():
+            out.append(0.0)  # a constant output has no signal to follow
+            continue
+        good = np.argwhere((stack[rows] == want[:, None, None, None]).all(axis=0))
+        if len(good) == 0:
+            out.append(0.0)
+            continue
+        d = np.abs(good - np.array(p)).sum(axis=1).min()
         out.append(max(0.0, 1.0 - d / span))
     return out
 
@@ -193,7 +228,8 @@ class Builder:
     def mask(self, c: Circuit) -> np.ndarray:
         block, facing = c.block, c.facing
         free = ~self.fixed_mask
-        solid = block == Block.SOLID
+        wall_ok = np.isin(block, WALL_SUPPORT)
+        stand_ok = np.isin(block, STANDING_SUPPORT)
         cols = []
         for kind, d in PLACEABLE:
             if kind in (Block.TORCH, Block.REPEATER):
@@ -201,12 +237,15 @@ class Builder:
             else:
                 same = block == kind
             ok = free & ~same
-            if kind == Block.TORCH:  # needs a solid block to attach to
+            if kind == Block.TORCH:  # needs a block that can hold it (see the simulator's rules)
                 dx, dy, dz = DIRS[d]
-                attach = np.zeros_like(solid)
+                support = stand_ok if d == DOWN else wall_ok
                 X, Y, Z = self.size
-                src = solid[max(dx, 0):X + min(dx, 0), max(dy, 0):Y + min(dy, 0), max(dz, 0):Z + min(dz, 0)]
+                attach = np.zeros_like(support)
+                src = support[max(dx, 0):X + min(dx, 0), max(dy, 0):Y + min(dy, 0), max(dz, 0):Z + min(dz, 0)]
                 attach[max(-dx, 0):X + min(-dx, 0), max(-dy, 0):Y + min(-dy, 0), max(-dz, 0):Z + min(-dz, 0)] = src
+                if d == DOWN and FLOOR_SUPPORT:
+                    attach[:, 0, :] = True  # the grid floor holds standing torches on the bottom layer
                 ok &= attach
             cols.append(ok.ravel())
         return np.concatenate([np.stack(cols, axis=1).ravel(), [True]])
@@ -247,6 +286,11 @@ class Policy:
 
 
 # ---------------------------------------------------------------- training
+def layout(c: Circuit) -> bytes:
+    """The circuit's blocks and facings, for spotting identical designs."""
+    return c.block.tobytes() + c.facing.tobytes()
+
+
 def bounding_dims(c: Circuit) -> list[int]:
     """Width, height and depth of the box around every block in the circuit."""
     idx = np.argwhere(c.block != Block.AIR)
@@ -263,6 +307,7 @@ class Individual:
     result: Evaluation | None = None
     blocks: int = 0
     volume: int = 0             # bounding box of every block, inputs and outputs included
+    parent: np.ndarray | None = None
 
     @property
     def dims(self) -> list[int]:
@@ -277,17 +322,20 @@ class GenerationStats:
     solved: int                 # individuals passing every row
     best: Individual
     new_best: bool
+    newest: Individual          # best of the networks that were new this generation
+    restarted: bool = False     # the population was stuck and has been replaced
 
     def to_dict(self) -> dict:
         return {"gen": self.gen, "best": self.best_rows, "mean": round(self.mean_rows, 3),
-                "solved": self.solved, "new_best": self.new_best, "blocks": self.best.blocks}
+                "solved": self.solved, "new_best": self.new_best, "blocks": self.best.blocks,
+                "restarted": self.restarted}
 
 
 class Trainer:
     """Genetic algorithm over Policy weights. Call ``generation()`` repeatedly."""
 
     def __init__(self, task: TruthTableTask, max_blocks: int = 12, population: int = 32,
-                 elites: int = 6, sigma: float = 0.08, seed: int | None = None):
+                 elites: int = 6, sigma: float = 0.08, seed: int | None = None, patience: int = 80):
         self.task = task
         self.builder = Builder(task)
         self.policy = Policy(self.builder.obs_size, self.builder.n_actions)
@@ -301,6 +349,13 @@ class Trainer:
         self.best: Individual | None = None
         self.best_gen = 0
         self.n_rows = len(task.rows)
+        # If the population's best has not improved for `patience` generations, it is
+        # stuck on a local optimum (say "OUT = A" when the task is "OUT = B"), so it
+        # starts over from fresh random networks. The best circuit so far is kept.
+        self.patience = int(patience)
+        self.stale = 0
+        self.pop_best: tuple = ()
+        self.restarts = 0
 
     def build(self, theta: np.ndarray) -> Circuit:
         b, c = self.builder, self.task.blank_circuit()
@@ -313,7 +368,10 @@ class Trainer:
             if action == b.n_actions - 1:
                 break
             pos, kind, facing = b.decode(action)
-            c.place(pos, kind, facing=facing)
+            try:
+                c.place(pos, kind, facing=facing)
+            except ValueError:  # a move the simulator refuses: treat it as stopping
+                break
         return c
 
     def fitness(self, c: Circuit) -> tuple[tuple, Evaluation, int, int]:
@@ -335,7 +393,8 @@ class Trainer:
         bit_frac = sum(bits) / max(1, len(bits))
         # An output that reacts to the inputs at all is a step away from "always off".
         reach = float(np.mean(res.reach))
-        hint = 0.5 * bit_frac + 0.3 * reach - (0.5 if not res.stable else 0.0)
+        match = float(np.mean(res.match))
+        hint = 0.4 * bit_frac + 0.2 * reach + 0.4 * match - (0.5 if not res.stable else 0.0)
         return (res.rows_passed, 0, hint, -blocks), res, blocks, volume
 
     def score(self, ind: Individual) -> None:
@@ -343,17 +402,43 @@ class Trainer:
         ind.fitness, ind.result, ind.blocks, ind.volume = self.fitness(ind.circuit)
 
     def generation(self) -> GenerationStats:
-        for ind in self.pop:
-            if ind.result is None:
-                self.score(ind)
+        fresh = [ind for ind in self.pop if ind.result is None]
+        seen = {layout(i.circuit) for i in self.pop if i.circuit is not None}
+        for ind in fresh:
+            # A small weight change often leaves the network's choices, and so the
+            # circuit, exactly as before. Evaluating a copy teaches nothing, so push
+            # harder until the child builds something new (a few tries at most).
+            for attempt in range(4):
+                ind.circuit = self.build(ind.theta)
+                key = layout(ind.circuit)
+                if key not in seen or ind.parent is None or attempt == 3:
+                    break
+                noise = self.rng.standard_normal(ind.theta.shape).astype(np.float32)
+                ind.theta = ind.parent + self.sigma * 2.0 ** (attempt + 1) * noise
+            seen.add(key)
+            ind.fitness, ind.result, ind.blocks, ind.volume = self.fitness(ind.circuit)
         self.pop.sort(key=lambda i: i.fitness, reverse=True)
         top = self.pop[0]
+        newest = max(fresh, key=lambda i: i.fitness) if fresh else top
+        if top.fitness > self.pop_best:
+            self.pop_best, self.stale = top.fitness, 0
+        else:
+            self.stale += 1
         new_best = self.best is None or top.fitness > self.best.fitness
         if new_best:
             self.best, self.best_gen = top, self.gen
         rows = [i.result.rows_passed for i in self.pop]
         stats = GenerationStats(self.gen, top.result.rows_passed, float(np.mean(rows)),
-                                sum(r == self.n_rows for r in rows), top, new_best)
+                                sum(r == self.n_rows for r in rows), top, new_best, newest)
+        self.gen += 1
+        solved = top.result.rows_passed == self.n_rows
+        # Once solved, give shrinking the circuit more time before starting over.
+        if self.stale >= self.patience * (3 if solved else 1):
+            self.pop = [Individual(self.policy.init(self.rng)) for _ in range(self.population)]
+            self.pop_best, self.stale = (), 0
+            self.restarts += 1
+            stats.restarted = True
+            return stats
         # Next generation: keep the elites, fill the rest with mutated copies of them.
         parents = self.pop[:self.elites]
         children = []
@@ -362,7 +447,6 @@ class Trainer:
             noise = self.rng.standard_normal(p.theta.shape).astype(np.float32)
             # Mostly small tweaks, sometimes a big jump to escape a plateau.
             scale = self.sigma * float(self.rng.choice([0.25, 1.0, 4.0]))
-            children.append(Individual(p.theta + scale * noise))
+            children.append(Individual(p.theta + scale * noise, parent=p.theta))
         self.pop = parents + children
-        self.gen += 1
         return stats
