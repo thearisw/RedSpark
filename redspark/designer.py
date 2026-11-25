@@ -551,7 +551,7 @@ class Trainer:
     """Genetic algorithm over Policy weights. Call ``generation()`` repeatedly."""
 
     def __init__(self, task: TruthTableTask, max_blocks: int = 12, population: int = 32,
-                 elites: int = 6, sigma: float = 0.08, seed: int | None = None, patience: int = 80,
+                 elites: int = 6, sigma: float = 0.08, seed: int | None = None, patience: int = 0,
                  workers: int | None = None):
         self.task = task
         self.builder = Builder(task)
@@ -569,6 +569,7 @@ class Trainer:
         # If the population's best has not improved for `patience` generations, it is
         # stuck on a local optimum (say "OUT = A" when the task is "OUT = B"), so it
         # starts over from fresh random networks. The best circuit so far is kept.
+        # 0 (the default) never starts over: progress is never thrown away.
         self.patience = int(patience)
         self.stale = 0
         self.pop_best: tuple = ()
@@ -721,7 +722,7 @@ class Trainer:
         self.gen += 1
         solved = top.result.rows_passed == self.n_rows
         # Once solved, give shrinking the circuit more time before starting over.
-        if self.stale >= self.patience * (3 if solved else 1):
+        if self.patience and self.stale >= self.patience * (3 if solved else 1):
             self.pop = [Individual(self.policy.init(self.rng)) for _ in range(self.population)]
             self.pop_best, self.stale = (), 0
             self.restarts += 1
@@ -834,7 +835,7 @@ class LayoutTrainer:
     """
 
     def __init__(self, task: TruthTableTask, max_blocks: int = 12, population: int = 48,
-                 elites: int = 8, seed: int | None = None, patience: int = 200,
+                 elites: int = 8, seed: int | None = None, patience: int = 0,
                  workers: int | None = None):
         self.task = task
         self.builder = Builder(task)
@@ -847,7 +848,7 @@ class LayoutTrainer:
         self.best: Individual | None = None
         self.best_gen = 0
         # Start over only when the population has not improved for `patience`
-        # generations and nothing is solved yet. A solved population keeps refining.
+        # generations and nothing is solved yet. 0 (the default) never starts over.
         self.patience = int(patience)
         self.stale = 0
         self.pop_best: tuple = ()
@@ -1057,7 +1058,7 @@ class LayoutTrainer:
         self._gen_times.append(time.perf_counter() - started)
         self._maybe_start_pool()
         solved = top.result.rows_passed == self.n_rows
-        if not solved and self.stale >= self.patience:
+        if self.patience and not solved and self.stale >= self.patience:
             # Start completely fresh: the best design so far stays in self.best (and on
             # screen), but not in the breeding pool, where it would take over again.
             self.pop = self._random_population()
