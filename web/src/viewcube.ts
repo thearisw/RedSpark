@@ -32,7 +32,7 @@ export class ViewCube {
   readonly canvas: HTMLCanvasElement;
   private renderer: THREE.WebGLRenderer;
   private scene = new THREE.Scene();
-  private camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0.1, 10);
+  private camera = new THREE.OrthographicCamera(-0.92, 0.92, 0.92, -0.92, 0.1, 10);
   private cube: THREE.Mesh;
   private hover = new THREE.Mesh(new THREE.BoxGeometry(1, 1, 1),
     new THREE.MeshBasicMaterial({ color: 0xffb347, transparent: true, opacity: 0.55, depthWrite: false }));
