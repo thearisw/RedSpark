@@ -78,8 +78,10 @@
             <option value="success">Successes only</option>
             <option value="best" selected>New bests</option>
             <option value="all">Every generation (newest attempt)</option>
+            <option value="samples">Samples being tested (random picks)</option>
           </select>
         </div>
+        <div><label title="Count every design scored, not just generations. Each generation scores the new children; designs seen before come from the cache."><input id="showSamples" type="checkbox" checked /> Show sample count</label></div>
         <div><label title="Show the four most recent circuits the Show filter lets through, newest top-left."><input id="multiView" type="checkbox" /> 2×2 multi-view (one generation per pane)</label></div>
         <label>Draw at most <input id="renderHz" type="range" min="1" max="10" value="4" /> <span id="renderHzLabel">4</span> circuits/s</label>
         <div class="muted">Generations in between are still counted in the chart.</div>
@@ -104,6 +106,8 @@
       <h2>Progress</h2>
       <div class="stats">
         <span class="muted">Generations</span><span id="gen">0</span>
+        <span class="muted sampleStat">Samples tested</span><span class="sampleStat" id="samples">0</span>
+        <span class="muted sampleStat">Samples/s</span><span class="sampleStat" id="sampleRate">–</span>
         <span class="muted">Best this gen</span><span id="genBest">–</span>
         <span class="muted">Solvers this gen</span><span id="genSolved">–</span>
         <span class="muted">Best so far</span><span id="bestEver">–</span>

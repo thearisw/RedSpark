@@ -124,3 +124,26 @@ def test_training_results_list_and_playing_a_result():
             pass
         lever = next(b for b in state["circuit"]["blocks"] if b["pos"] == [0, 0, 1])
         assert not lever["on"]
+
+
+def test_samples_mode_draws_tested_designs_and_counts_samples():
+    import time
+    with client.websocket_connect("/ws") as ws:
+        ws.send_json({"type": "train_start", "task": NOT_TASK, "gps": 0, "show": "samples", "render_hz": 4})
+        started = time.monotonic()
+        circuits, progress = [], []
+        while time.monotonic() - started < 1.2:
+            msg = ws.receive_json()
+            if msg["type"] == "train_progress":
+                progress.append(msg)
+            elif msg["type"] == "train_circuit":
+                circuits.append(msg)
+        ws.send_json({"type": "train_pause"})
+        while (msg := ws.receive_json())["type"] != "train_progress" or msg["running"]:
+            pass
+        assert 1 <= len(circuits) <= 7                              # still capped by render_hz
+        assert all(c["kind"] == "samples" and c["sample"] >= 1 for c in circuits)
+        assert [c["sample"] for c in circuits] == sorted(c["sample"] for c in circuits)
+        assert msg["samples"] >= msg["simulated"] > 0 and msg["samples"] >= circuits[-1]["sample"]
+        samples = [p["samples"] for p in progress]
+        assert samples == sorted(samples)

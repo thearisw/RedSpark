@@ -251,3 +251,19 @@ def test_layout_trainer_places_comparators():
             seen |= set(int(v) for v in np.unique(ind.lay.block))
     tr.close()
     assert int(Block.COMPARATOR) in seen
+
+
+def test_layout_trainer_counts_samples_and_cache_hits():
+    from redspark.designer import LayoutTrainer
+    tr = LayoutTrainer(not_task(), seed=0, workers=0)
+    try:
+        total = 0
+        for _ in range(20):
+            stats = tr.generation()
+            total += len(stats.fresh)
+            assert stats.samples == tr.samples == total
+            assert all(ind.result is not None for ind in stats.fresh)
+        assert 0 < tr.simulated <= tr.samples
+        assert stats.to_dict()["samples"] == total
+    finally:
+        tr.close()

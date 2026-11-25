@@ -16,6 +16,7 @@ const FACING: Record<Facing, THREE.Vector3> = {
 };
 
 import * as T from "./textures";
+import { ViewCube } from "./viewcube";
 
 const PX = 1 / 16; // one texture pixel in world units
 
@@ -271,6 +272,11 @@ export class CircuitView {
   private drag: { axis: 0 | 1 | 2; side: 1 | -1; origin: THREE.Vector3; dir: THREE.Vector3; applied: number; id: number } | null = null;
   /** Called with the pane index (0-3) when a pane is clicked in multi-view. */
   onPaneClick: ((pane: number) => void) | null = null;
+  /** The default view of the current grid, which the home button returns to. */
+  private home = { position: new THREE.Vector3(6, 8, 10), target: new THREE.Vector3() };
+  /** A running camera animation (home button or a viewcube snap). */
+  private tween: { t0: number; ms: number; fromDir: THREE.Vector3; turn: THREE.Quaternion; fromDist: number; toDist: number; fromTarget: THREE.Vector3; toTarget: THREE.Vector3 } | null = null;
+  private viewCube: ViewCube;
 
   constructor(container: HTMLElement, onLeverClick: (pos: [number, number, number]) => void) {
     this.renderer = new THREE.WebGLRenderer({ antialias: false }); // crisp pixel edges
@@ -298,6 +304,20 @@ export class CircuitView {
 
     this.controls = new OrbitControls(this.camera, this.renderer.domElement);
     this.controls.enableDamping = true;
+    this.controls.addEventListener("start", () => (this.tween = null)); // the user takes over
+
+    // Navigation corner: a viewcube to snap or orbit the camera, and a home button.
+    // Multi-view panes share this camera, so these turn all four panes together.
+    this.viewCube = new ViewCube((dir) => this.lookFrom(dir), (dx, dy) => this.orbitBy(dx, dy));
+    const nav = document.createElement("div");
+    nav.id = "navTools";
+    const homeBtn = document.createElement("button");
+    homeBtn.id = "homeView";
+    homeBtn.title = "Home: back to the default view";
+    homeBtn.innerHTML = '<svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path d="M3 11.5 12 4l9 7.5M5.5 9.5V20h5v-6h3v6h5V9.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/></svg> Home';
+    homeBtn.addEventListener("click", () => this.goHome());
+    nav.append(this.viewCube.canvas, homeBtn);
+    container.appendChild(nav);
 
     // A click is a press and release of one button with (almost) no movement in between, so
     // orbiting (left drag) and panning (right drag) never count as clicks.
@@ -358,10 +378,75 @@ export class CircuitView {
     window.addEventListener("resize", () => this.resize());
     this.resize();
     this.renderer.setAnimationLoop(() => {
-      this.controls.update();
+      if (this.tween) this.stepTween();
+      else this.controls.update();
       if (this.multiArea) this.renderPanes();
       else this.composer.render();
+      this.viewCube.render(this.camera.position.clone().sub(this.controls.target), this.camera.up);
     });
+  }
+
+  /** Apply any orbit momentum left from damping now, so it can't nudge the camera after we move it. */
+  private settle(): void {
+    this.controls.enableDamping = false;
+    this.controls.update();
+    this.controls.enableDamping = true;
+  }
+
+  /** Animate the camera to look at ``target`` from ``dir`` (unit vector) at ``dist``. */
+  private animateTo(dir: THREE.Vector3, dist: number, target: THREE.Vector3, ms = 400): void {
+    this.settle();
+    const offset = this.camera.position.clone().sub(this.controls.target);
+    // looking straight up or down would make OrbitControls' "up" undefined, so tilt a hair towards the front
+    const to = dir.clone();
+    if (Math.abs(to.y) > 0.999) to.set(0, Math.sign(to.y), 0.002);
+    to.normalize();
+    const fromDir = offset.clone().normalize();
+    this.tween = {
+      t0: performance.now(), ms, fromDir,
+      turn: new THREE.Quaternion().setFromUnitVectors(fromDir, to),
+      fromDist: offset.length(), toDist: dist,
+      fromTarget: this.controls.target.clone(), toTarget: target.clone(),
+    };
+  }
+
+  private stepTween(): void {
+    const tw = this.tween!;
+    const t = Math.min(1, (performance.now() - tw.t0) / tw.ms);
+    const k = t < 0.5 ? 4 * t * t * t : 1 - (-2 * t + 2) ** 3 / 2; // ease in-out
+    const q = new THREE.Quaternion().slerp(tw.turn, k);
+    const dir = tw.fromDir.clone().applyQuaternion(q);
+    this.controls.target.lerpVectors(tw.fromTarget, tw.toTarget, k);
+    this.camera.position.copy(this.controls.target).addScaledVector(dir, THREE.MathUtils.lerp(tw.fromDist, tw.toDist, k));
+    this.camera.lookAt(this.controls.target);
+    if (t >= 1) {
+      this.tween = null;
+      this.settle();
+    }
+  }
+
+  /** Snap the camera back to the default view of the grid. */
+  goHome(): void {
+    const offset = this.home.position.clone().sub(this.home.target);
+    this.animateTo(offset.clone().normalize(), offset.length(), this.home.target);
+  }
+
+  /** Look at the current target from direction ``dir``, keeping the zoom (viewcube click). */
+  private lookFrom(dir: THREE.Vector3): void {
+    this.animateTo(dir, this.camera.position.distanceTo(this.controls.target), this.controls.target);
+  }
+
+  /** Orbit around the target by a pointer drag of (dx, dy) CSS pixels (viewcube drag). */
+  private orbitBy(dx: number, dy: number): void {
+    this.tween = null;
+    this.settle();
+    const offset = this.camera.position.clone().sub(this.controls.target);
+    const s = new THREE.Spherical().setFromVector3(offset);
+    s.theta -= dx * 0.012;
+    s.phi = THREE.MathUtils.clamp(s.phi - dy * 0.012, 0.002, Math.PI - 0.002);
+    offset.setFromSpherical(s);
+    this.camera.position.copy(this.controls.target).add(offset);
+    this.camera.lookAt(this.controls.target);
   }
 
   /** Turn the 2x2 multi-view on (panes are laid out inside ``area()``, in CSS pixels) or off (null). */
@@ -601,11 +686,14 @@ export class CircuitView {
     plate.position.set((X - 1) / 2, -0.001, (Z - 1) / 2);
     plate.receiveShadow = true;
     this.floor.add(plate);
-    if (!moveCamera) return;
     const centre = new THREE.Vector3((X - 1) / 2, Y / 2, (Z - 1) / 2);
     const dist = Math.max(X, Y, Z) * 1.1 + 2;
-    this.camera.position.set(centre.x + dist * 0.5, centre.y + dist * 0.8, centre.z + dist);
-    this.controls.target.copy(centre);
+    this.home.position.set(centre.x + dist * 0.5, centre.y + dist * 0.8, centre.z + dist);
+    this.home.target.copy(centre);
+    if (!moveCamera) return;
+    this.tween = null;
+    this.camera.position.copy(this.home.position);
+    this.controls.target.copy(this.home.target);
   }
 
   /** Re-frame the floor and camera when the grid size changes. */

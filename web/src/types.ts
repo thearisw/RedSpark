@@ -32,9 +32,10 @@ export interface GenStats {
   new_best: boolean;
   blocks: number; // blocks used by the best network of this generation
   restarted: boolean; // the population was stuck and started over
+  samples: number; // designs scored so far in this run
 }
 
-export type ShowMode = "success" | "best" | "all";
+export type ShowMode = "success" | "best" | "all" | "samples";
 
 export type ServerMessage =
   | { type: "state"; name: string | null; playing: boolean; circuit: CircuitState | null }
@@ -44,6 +45,8 @@ export type ServerMessage =
       running: boolean;
       gen: number;
       rows_total: number;
+      samples: number; // designs scored so far in this run
+      simulated: number | null; // of those, the ones not taken from the cache (null: not tracked)
       stats: GenStats[];
       best_ever: { gen: number; rows: number; blocks: number; dims: number[]; delay: number } | null;
     }
@@ -51,6 +54,7 @@ export type ServerMessage =
       type: "train_circuit";
       gen: number;
       kind: ShowMode | "best_ever";
+      sample: number | null; // the design's number in the run (show "samples" only)
       rows_passed: number;
       rows_total: number;
       passed: boolean[];

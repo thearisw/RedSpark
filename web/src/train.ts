@@ -26,7 +26,10 @@ const delayText = (gt: number) => `${gt} gt to activate`;
 const samePos = (a: Pos, b: Pos) => a[0] === b[0] && a[1] === b[1] && a[2] === b[2];
 type TrainCircuit = Extract<ServerMessage, { type: "train_circuit" }>;
 const KIND_NAME = (k: TrainCircuit["kind"]) =>
-  k === "best_ever" ? "Best so far" : k === "success" ? "Success" : k === "best" ? "New best" : "Newest attempt";
+  k === "best_ever" ? "Best so far" : k === "success" ? "Success" : k === "best" ? "New best" : k === "samples" ? "Sample" : "Newest attempt";
+const fmt = (n: number) => n.toLocaleString("en-US");
+/** "gen 12" or, for a tested sample, "sample 431 (gen 12)". */
+const genText = (c: TrainCircuit) => (c.sample != null ? `sample ${fmt(c.sample)} (gen ${c.gen})` : `gen ${c.gen}`);
 
 /** Truth-table training: place inputs/outputs, fill the table, run and watch generations. */
 export class TrainMode {
@@ -47,6 +50,8 @@ export class TrainMode {
   private paneLabels: HTMLDivElement[] = [];
   private frameIdx = 0;
   private chart: ProgressChart;
+  /** Recent (time ms, samples) readings for the samples/s figure. */
+  private rate: [number, number][] = [];
 
   constructor(private view: CircuitView, private socket: SimSocket) {
     this.size = [5, 1, 3];
@@ -83,6 +88,14 @@ export class TrainMode {
     $("save").addEventListener("click", () =>
       socket.send({ type: "train_save", name: $<HTMLInputElement>("saveName").value || "designed" }));
     for (const id of ["gps", "showMode", "renderHz"]) $(id).addEventListener("input", () => this.sendConfig());
+    const showSamples = $<HTMLInputElement>("showSamples");
+    showSamples.checked = localStorage.getItem("redspark.showSamples") !== "0";
+    const applySamples = () => {
+      document.querySelectorAll<HTMLElement>(".sampleStat").forEach((el) => (el.hidden = !showSamples.checked));
+      localStorage.setItem("redspark.showSamples", showSamples.checked ? "1" : "0");
+    };
+    showSamples.addEventListener("change", applySamples);
+    applySamples();
     $("renderHz").addEventListener("input", () => ($("renderHzLabel").textContent = $<HTMLInputElement>("renderHz").value));
 
     const overlay = $("multiPanes");
@@ -154,7 +167,7 @@ export class TrainMode {
       Object.assign(el.style, { left: `${r.x}px`, top: `${r.y}px`, width: `${r.w}px`, height: `${r.h}px` });
       el.classList.toggle("selected", !!p && p === this.selected);
       el.textContent = p
-        ? `${KIND_NAME(p.kind)}${i === 0 && p.kind !== "all" ? " (newest)" : ""} · gen ${p.gen} · ${p.rows_passed} / ${p.rows_total} rows · ${p.blocks} blocks`
+        ? `${KIND_NAME(p.kind)}${i === 0 && p.kind !== "all" && p.kind !== "samples" ? " (newest)" : ""} · ${genText(p)} · ${p.rows_passed} / ${p.rows_total} rows · ${p.blocks} blocks`
         : "Waiting for a circuit…";
     });
   }
@@ -171,7 +184,7 @@ export class TrainMode {
     this.layoutPanes();
     const s = this.selected;
     $("shownCaption").textContent = s
-      ? `Table: ${KIND_NAME(s.kind)}, gen ${s.gen}, ${s.rows_passed} / ${s.rows_total} rows, ${s.blocks} blocks, ${dimsText(s.dims)}, ${delayText(s.delay)}. ` +
+      ? `Table: ${KIND_NAME(s.kind)}, ${genText(s)}, ${s.rows_passed} / ${s.rows_total} rows, ${s.blocks} blocks, ${dimsText(s.dims)}, ${delayText(s.delay)}. ` +
         `Showing row ${this.frameIdx + 1} in every pane. Click a pane to see its table.`
       : "";
     this.renderTable();
@@ -358,6 +371,7 @@ export class TrainMode {
     this.startedTask = JSON.stringify(task);
     this.rowsTotal = task.rows.length;
     this.chart.reset(this.rowsTotal);
+    this.rate = [];
     this.shown = null;
     this.panes = [];
     this.selected = null;
@@ -377,8 +391,10 @@ export class TrainMode {
     this.panes = [];
     this.selected = null;
     this.chart.reset(this.combos().length);
-    for (const id of ["genBest", "genSolved", "bestEver"]) $(id).textContent = "–";
+    for (const id of ["genBest", "genSolved", "bestEver", "sampleRate"]) $(id).textContent = "–";
     $("gen").textContent = "0";
+    $("samples").textContent = "0";
+    this.rate = [];
     $("run").textContent = "Run";
     $("taskNote").textContent = "";
     this.renderTable();
@@ -407,6 +423,7 @@ export class TrainMode {
       if (restarts) this.status(`Stuck for a while, so training started over with fresh networks (gen ${msg.stats.filter((x) => x.restarted).pop()!.gen}). The best circuit so far is kept.`);
       const t = msg.rows_total;
       $("gen").textContent = String(msg.gen);
+      this.showSampleCount(msg.samples, msg.simulated, msg.running);
       if (last) {
         $("genBest").textContent = `${last.best} / ${t} rows`;
         $("genSolved").textContent = String(last.solved);
@@ -439,6 +456,23 @@ export class TrainMode {
     return false;
   }
 
+  /** Samples tested so far, and how many per second over the last couple of seconds. */
+  private showSampleCount(samples: number, simulated: number | null, running: boolean): void {
+    const cached = simulated == null ? null : samples - simulated;
+    $("samples").textContent = fmt(samples) + (cached ? ` (${fmt(cached)} from cache)` : "");
+    $("samples").title = simulated == null ? "" : `${fmt(simulated)} simulated, ${fmt(cached ?? 0)} seen before and taken from the cache`;
+    const now = performance.now();
+    if (!running) {
+      this.rate = [];
+      $("sampleRate").textContent = "–";
+      return;
+    }
+    this.rate.push([now, samples]);
+    while (this.rate.length > 2 && now - this.rate[0][0] > 2000) this.rate.shift();
+    const [t0, s0] = this.rate[0];
+    if (now - t0 >= 300) $("sampleRate").textContent = fmt(Math.round(((samples - s0) * 1000) / (now - t0)));
+  }
+
   private drawShown(): void {
     if (this.multi && this.panes.length) return this.drawPanes();
     const s = this.shown;
@@ -451,7 +485,7 @@ export class TrainMode {
     this.view.showLayer(null);
     const what = KIND_NAME(s.kind);
     $("shownCaption").textContent =
-      `${what}: gen ${s.gen}, ${s.rows_passed} / ${s.rows_total} rows, ${s.blocks} blocks, ${dimsText(s.dims)}, ${delayText(s.delay)}. Showing row ${this.frameIdx + 1}.`;
+      `${what}: ${genText(s)}, ${s.rows_passed} / ${s.rows_total} rows, ${s.blocks} blocks, ${dimsText(s.dims)}, ${delayText(s.delay)}. Showing row ${this.frameIdx + 1}.`;
     this.renderTable();
   }
 

@@ -540,11 +540,13 @@ class GenerationStats:
     new_best: bool
     newest: Individual          # best of the networks that were new this generation
     restarted: bool = False     # the population was stuck and has been replaced
+    samples: int = 0            # designs scored so far in this run, this generation's included
+    fresh: list = field(default_factory=list)  # the designs scored this generation (new ones only)
 
     def to_dict(self) -> dict:
         return {"gen": self.gen, "best": self.best_rows, "mean": round(self.mean_rows, 3),
                 "solved": self.solved, "new_best": self.new_best, "blocks": self.best.blocks,
-                "restarted": self.restarted}
+                "restarted": self.restarted, "samples": self.samples}
 
 
 class Trainer:
@@ -566,6 +568,7 @@ class Trainer:
         self.best: Individual | None = None
         self.best_gen = 0
         self.n_rows = len(task.rows)
+        self.samples = 0  # designs scored (each new child counts once, cached or not)
         # If the population's best has not improved for `patience` generations, it is
         # stuck on a local optimum (say "OUT = A" when the task is "OUT = B"), so it
         # starts over from fresh random networks. The best circuit so far is kept.
@@ -719,6 +722,8 @@ class Trainer:
         rows = [i.result.rows_passed for i in self.pop]
         stats = GenerationStats(self.gen, top.result.rows_passed, float(np.mean(rows)),
                                 sum(r == self.n_rows for r in rows), top, new_best, newest)
+        self.samples += len(fresh)
+        stats.samples, stats.fresh = self.samples, fresh
         self.gen += 1
         solved = top.result.rows_passed == self.n_rows
         # Once solved, give shrinking the circuit more time before starting over.
@@ -853,6 +858,8 @@ class LayoutTrainer:
         self.stale = 0
         self.pop_best: tuple = ()
         self.restarts = 0
+        self.samples = 0    # designs scored (each new child counts once, cached or not)
+        self.simulated = 0  # of those, the ones that were not in the cache and ran in the simulator
         self.workers = workers
         self._pool: _LayoutPool | None = None
         self._gen_times: list[float] = []
@@ -1001,6 +1008,7 @@ class LayoutTrainer:
         cached = self._cache.get(key)
         if cached is None:
             cached = score_layout(self.task, lay)
+            self.simulated += 1
             self._cache[key] = cached
             if len(self._cache) > 50000:
                 self._cache.pop(next(iter(self._cache)))
@@ -1036,6 +1044,7 @@ class LayoutTrainer:
             try:
                 for (i, k), cached in zip(missing, self._pool.score([fresh[i].lay for i, _ in missing])):
                     self._cache[k] = cached
+                    self.simulated += 1
             except Exception:
                 self._pool.close()
                 self._pool, self.workers = None, 0
@@ -1054,6 +1063,8 @@ class LayoutTrainer:
         rows = [i.result.rows_passed for i in self.pop]
         stats = GenerationStats(self.gen, top.result.rows_passed, float(np.mean(rows)),
                                 sum(r == self.n_rows for r in rows), top, new_best, newest)
+        self.samples += len(fresh)
+        stats.samples, stats.fresh = self.samples, fresh
         self.gen += 1
         self._gen_times.append(time.perf_counter() - started)
         self._maybe_start_pool()

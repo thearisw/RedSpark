@@ -18,7 +18,7 @@ client -> server
   truth-table training (see redspark/designer.py)
     {"type": "train_start", "task": {size, inputs: [{label, pos}], outputs: [{label, pos}],
        rows: [{in: [bool...], out: [bool|null...]}]}, "max_blocks": 12, "method": "layout" | "network",
-       "gps": 10, "show": "success"|"best"|"all", "render_hz": 4}
+       "gps": 10, "show": "success"|"best"|"all"|"samples", "render_hz": 4}
                                                  new population, start running
     {"type": "train_pause"} / {"type": "train_resume"}
     {"type": "train_config", "gps": 0, "show": ..., "render_hz": ...}   gps 0 = as fast as possible
@@ -30,10 +30,14 @@ client -> server
 
 server -> client
     {"type": "state", "name": ..., "circuit": {size, ticks, blocks: [...]}}
-    {"type": "train_progress", "running", "gen", "rows_total", "stats": [{gen, best, mean, solved, new_best, blocks}],
+    {"type": "train_progress", "running", "gen", "rows_total", "samples", "simulated",
+       "stats": [{gen, best, mean, solved, new_best, blocks, samples}],
        "best_ever": {gen, rows, blocks, dims, delay}}             stats for every generation since the last message
-    {"type": "train_circuit", "gen", "kind", "rows_passed", "rows_total", "passed", "got", "blocks", "dims", "delay",
-       "frames": [circuit per truth-table row]}   at most render_hz per second
+                                                 samples: designs scored so far; simulated: those not
+                                                 taken from the cache (null for the network method)
+    {"type": "train_circuit", "gen", "kind", "sample", "rows_passed", "rows_total", "passed", "got", "blocks", "dims", "delay",
+       "frames": [circuit per truth-table row]}   at most render_hz per second; "sample" is the
+                                                 design's number in the run for show "samples", else null
     {"type": "saved", "name": ...}
     {"type": "train_results", "results": [{id, gen, rows, rows_total, blocks, dims, delay, circuit}]}
                                                  every new best of this run, oldest first (the last 50)
@@ -44,6 +48,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import random
 import re
 import time
 from pathlib import Path
@@ -142,7 +147,7 @@ class Session:
         await self.send_state()
 
 
-SHOW_MODES = ("success", "best", "all")
+SHOW_MODES = ("success", "best", "all", "samples")
 
 
 class Training:
@@ -152,6 +157,12 @@ class Training:
     circuits are sent at most ``render_hz`` times a second, so "show every
     generation" at full speed never asks the viewer to draw thousands of
     circuits. Generations in between still appear in the progress chart.
+
+    Show "samples" draws designs as they are tested, good or bad: each time a
+    circuit is due, one design picked at random from the latest generation's
+    new ones. Nothing extra is simulated for this beyond the circuit that is
+    drawn, so training runs just as fast; with 2x2 multi-view the four panes
+    are the four latest picks.
     """
 
     def __init__(self, session: Session):
@@ -163,7 +174,8 @@ class Training:
         self.show = "best"
         self.render_hz = 4.0
         self.results: list[dict] = []  # every new best of the current run, for the Results tab
-        self._wake = asyncio.Event()  # cuts the between-generations wait short on pause
+        self._wake = asyncio.Event()
+        self._rng = random.Random()  # picks which tested design to draw in "samples" mode  # cuts the between-generations wait short on pause
 
     def configure(self, msg: dict) -> None:
         if "gps" in msg:
@@ -234,6 +246,7 @@ class Training:
         await self.session.send({
             "type": "train_progress", "running": self.running, "gen": t.gen if t else 0,
             "rows_total": t.n_rows if t else 0, "stats": stats,
+            "samples": t.samples if t else 0, "simulated": getattr(t, "simulated", None) if t else None,
             "best_ever": {"gen": t.best_gen, "rows": t.best.result.rows_passed, "blocks": t.best.blocks,
                           "dims": t.best.dims, "delay": t.best.result.delay} if t and t.best else None,
         })
@@ -253,22 +266,30 @@ class Training:
     async def send_results(self) -> None:
         await self.session.send({"type": "train_results", "results": self.results})
 
-    async def send_circuit(self, ind, gen: int, kind: str) -> None:
+    async def send_circuit(self, ind, gen: int, kind: str, sample: int | None = None) -> None:
         res = evaluate(ind.circuit, self.trainer.task, frames=True)
         await self.session.send({
-            "type": "train_circuit", "gen": gen, "kind": kind, "rows_passed": res.rows_passed,
+            "type": "train_circuit", "gen": gen, "kind": kind, "sample": sample, "rows_passed": res.rows_passed,
             "rows_total": len(res.passed), "passed": res.passed, "got": res.got,
             "blocks": ind.blocks, "dims": ind.dims, "delay": res.delay, "frames": res.frames,
         })
 
     def shown(self, stats):
-        """Which network to draw: in "every generation" mode the best of that
-        generation's new networks (the kept elites would repeat the same design),
-        otherwise the generation's best."""
-        return stats.newest if self.show == "all" else stats.best
+        """(design to draw, its sample number or None). In "every generation" mode
+        the best of that generation's new designs (the kept elites would repeat the
+        same design), in "samples" mode a random one of them, otherwise the
+        generation's best."""
+        if self.show == "samples" and stats.fresh:
+            i = self._rng.randrange(len(stats.fresh))
+            return stats.fresh[i], stats.samples - len(stats.fresh) + i + 1
+        return (stats.newest if self.show == "all" else stats.best), None
+
+    async def send_shown(self, stats) -> None:
+        ind, sample = self.shown(stats)
+        await self.send_circuit(ind, stats.gen, self.show, sample)
 
     def wanted(self, stats) -> bool:
-        if self.show == "all":
+        if self.show in ("all", "samples"):
             return True
         if self.show == "best":
             return stats.new_best
@@ -316,7 +337,7 @@ class Training:
                     candidate = stats
             now = time.monotonic()
             if candidate is not None and now - last_circuit >= 1.0 / self.render_hz:
-                await self.send_circuit(self.shown(candidate), candidate.gen, self.show)
+                await self.send_shown(candidate)
                 candidate, last_circuit = None, now
             if now - last_stats >= 0.1:
                 await self.send_progress(pending)
@@ -329,7 +350,7 @@ class Training:
             except asyncio.TimeoutError:
                 pass
         if candidate is not None:
-            await self.send_circuit(self.shown(candidate), candidate.gen, self.show)
+            await self.send_shown(candidate)
         await self.send_progress(pending)
 
 
