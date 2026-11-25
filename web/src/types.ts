@@ -60,4 +60,17 @@ export type ServerMessage =
       delay: number; // activation time: game ticks for the slowest row's outputs to settle
       frames: CircuitState[];
     }
-  | { type: "saved"; name: string };
+  | { type: "saved"; name: string }
+  | { type: "train_results"; results: TrainResult[] };
+
+/** A new best circuit from the current training run (see the Results tab). */
+export interface TrainResult {
+  id: number;
+  gen: number;
+  rows: number;
+  rows_total: number;
+  blocks: number;
+  dims: number[];
+  delay: number;
+  circuit: unknown; // circuit file data, sent back with "load_data" to play it
+}

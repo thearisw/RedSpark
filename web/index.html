@@ -46,6 +46,17 @@
         border: 1px solid #2c3038; border-radius: 4px; color: #c3c2b7; font: 12px system-ui, sans-serif;
         text-shadow: 0 1px 2px #000; font-variant-numeric: tabular-nums; }
       #multiPanes > div.selected { border-color: #ffb347; }
+      #subtabs { display: flex; gap: 4px; margin: 0 0 4px; }
+      #subtabs button { flex: 1; background: none; color: #9aa0aa; border: none; border-bottom: 2px solid #2c3038; padding: 3px; cursor: pointer; }
+      #subtabs button.on { color: #fff; border-bottom-color: #ffb347; }
+      #resList { display: flex; flex-direction: column; gap: 3px; max-height: 45vh; overflow-y: auto; margin: 4px 0; }
+      #resList button.result { display: grid; grid-template-columns: 44px 64px 1fr; gap: 6px; text-align: left; align-items: center;
+        background: #1c1f26; color: #e8e8ea; border: 1px solid #2c3038; border-radius: 5px; padding: 4px 6px; cursor: pointer;
+        font-variant-numeric: tabular-nums; margin: 0; }
+      #resList button.result:hover { border-color: #4a505c; }
+      #resList button.result.on { border-color: #ffb347; background: #2a2a26; }
+      #resList .ok { color: #0ca30c; font-weight: 600; }
+      #resList .partial { color: #ffb347; }
       [hidden] { display: none !important; }
     </style>
   </head>
@@ -68,6 +79,27 @@
       </div>
 
       <div id="trainMode" hidden>
+        <div id="subtabs"><button id="subSetup" class="on">Setup</button><button id="subResults">Results</button></div>
+
+        <div id="trainResults" hidden>
+          <h2>Best results so far</h2>
+          <div class="muted">Every new best circuit of this run, newest first. Click one to play it.</div>
+          <div id="resList"></div>
+          <div id="resPlayer" hidden>
+            <h2>View mode</h2>
+            <div id="resCaption" class="muted"></div>
+            <div class="row">
+              <button id="resPlay">Play</button>
+              <button id="resStep">Step</button>
+              <button id="resReset">Reset</button>
+            </div>
+            <label>Speed <input id="resTps" type="range" min="1" max="20" value="20" /> <span id="resTpsLabel">20</span> ticks/s</label>
+            <div>Game tick <span id="resTicks">0</span></div>
+            <div class="muted"><b>Left click</b> a lever to flip it. Drag to orbit, right-drag to pan, scroll to zoom.</div>
+          </div>
+        </div>
+
+        <div id="trainSetup">
         <h2>Grid</h2>
         <div class="row">
           <label>W <input id="sizeX" type="number" min="1" max="9" /></label>
@@ -75,10 +107,11 @@
           <label>H <input id="sizeY" type="number" min="1" max="3" /></label>
         </div>
         <div class="row"><label>Place on layer</label><select id="layer"></select></div>
-        <div id="toolHint" class="muted"><b>Left click</b> a cell: add an input lever (A–D).<br /><b>Right click</b> a cell: add an output lamp (OUT1–OUT4).<br />Click it again with the same button to remove it. Drag to orbit, right-drag to pan.</div>
+        <div id="toolHint" class="muted"><b>Left click</b> a cell: add an input lever (A–D).<br /><b>Right click</b> a cell: add an output lamp (OUT1–OUT4).<br />Click it again with the same button to remove it. Drag the coloured balls at the edges to stretch the grid. Drag to orbit, right-drag to pan.</div>
 
         <h2>Training</h2>
         <div class="row"><label>Max blocks</label><input id="maxBlocks" type="number" min="1" max="40" value="12" /></div>
+        <div class="row"><label>Method</label><select id="trainMethod" title="How new designs are made"><option value="layout" selected>Evolve layouts (fast)</option><option value="network">Evolve a network (old)</option></select></div>
         <div class="row">
           <button id="run">Run</button>
           <button id="restart" title="Stop and throw away this population. Run then starts from scratch.">Reset</button>
@@ -109,6 +142,7 @@
           <button id="editGrid">Edit grid</button>
         </div>
         <div class="row"><input id="saveName" placeholder="name" value="my_gate" /><button id="save">Save best</button></div>
+        </div>
       </div>
       <div id="status" class="muted">Connecting...</div>
     </div>

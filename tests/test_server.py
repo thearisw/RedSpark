@@ -90,3 +90,37 @@ def test_clicking_a_comparator_switches_its_mode():
         state = ws.receive_json()
         comp = next(b for b in state["circuit"]["blocks"] if b["type"] == "comparator")
         assert comp["mode"] == "subtract"
+
+
+def test_training_results_list_and_playing_a_result():
+    with client.websocket_connect("/ws") as ws:
+        ws.send_json({"type": "train_results"})
+        assert ws.receive_json() == {"type": "train_results", "results": []}
+        ws.send_json({"type": "train_start", "task": NOT_TASK, "gps": 0, "show": "best", "render_hz": 1})
+        while (msg := ws.receive_json())["type"] != "train_results":
+            pass
+        ws.send_json({"type": "train_pause"})
+        ws.send_json({"type": "train_results"})
+        while (msg := ws.receive_json())["type"] != "train_results":
+            pass
+        results = msg["results"]
+        assert results and [r["id"] for r in results] == list(range(1, len(results) + 1))
+        assert [r["gen"] for r in results] == sorted(r["gen"] for r in results)
+        best = results[-1]
+        assert best["rows_total"] == 2 and "blocks" in best["circuit"]
+
+        # play the result like a saved circuit: levers can be flipped and reset reloads it
+        ws.send_json({"type": "load_data", "circuit": best["circuit"], "name": "Result"})
+        while (state := ws.receive_json())["type"] != "state":
+            pass
+        assert state["name"] == "Result"
+        ws.send_json({"type": "toggle", "pos": [0, 0, 1]})
+        while (state := ws.receive_json())["type"] != "state":
+            pass
+        lever = next(b for b in state["circuit"]["blocks"] if b["pos"] == [0, 0, 1])
+        assert lever["type"] == "lever" and lever["on"]
+        ws.send_json({"type": "reset"})
+        while (state := ws.receive_json())["type"] != "state":
+            pass
+        lever = next(b for b in state["circuit"]["blocks"] if b["pos"] == [0, 0, 1])
+        assert not lever["on"]

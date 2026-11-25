@@ -17,13 +17,16 @@ client -> server
 
   truth-table training (see redspark/designer.py)
     {"type": "train_start", "task": {size, inputs: [{label, pos}], outputs: [{label, pos}],
-       rows: [{in: [bool...], out: [bool|null...]}]}, "max_blocks": 12,
+       rows: [{in: [bool...], out: [bool|null...]}]}, "max_blocks": 12, "method": "layout" | "network",
        "gps": 10, "show": "success"|"best"|"all", "render_hz": 4}
                                                  new population, start running
     {"type": "train_pause"} / {"type": "train_resume"}
     {"type": "train_config", "gps": 0, "show": ..., "render_hz": ...}   gps 0 = as fast as possible
     {"type": "train_show_best"}                  send the best circuit found so far
     {"type": "train_save", "name": "my_gate"}    save the best circuit to circuits/<name>.json
+    {"type": "train_results"}                    send the list of best circuits so far
+    {"type": "load_data", "circuit": {...}, "name": "Result 3"}
+                                                 play a circuit dict (e.g. a training result) like a saved one
 
 server -> client
     {"type": "state", "name": ..., "circuit": {size, ticks, blocks: [...]}}
@@ -32,6 +35,8 @@ server -> client
     {"type": "train_circuit", "gen", "kind", "rows_passed", "rows_total", "passed", "got", "blocks", "dims", "delay",
        "frames": [circuit per truth-table row]}   at most render_hz per second
     {"type": "saved", "name": ...}
+    {"type": "train_results", "results": [{id, gen, rows, rows_total, blocks, dims, delay, circuit}]}
+                                                 every new best of this run, oldest first (the last 50)
     {"type": "error", "message": ...}
 """
 
@@ -52,7 +57,7 @@ from starlette.routing import Mount, Route, WebSocketRoute
 from starlette.staticfiles import StaticFiles
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
-from .designer import Trainer, TruthTableTask, evaluate
+from .designer import LayoutTrainer, Trainer, TruthTableTask, evaluate
 from .sim import Block, Circuit
 
 CIRCUITS_DIR = Path(__file__).resolve().parents[1] / "circuits"
@@ -85,6 +90,7 @@ class Session:
     def __init__(self, ws: WebSocket):
         self.ws = ws
         self.name: str | None = None
+        self.data: dict | None = None  # circuit loaded with "load_data", reloaded by "reset"
         self.circuit: Circuit | None = None
         self.playing = False
         self.tps = 20.0
@@ -105,10 +111,16 @@ class Session:
             self.playing = False
             await self.training.handle(kind, msg)
             return
-        if kind in ("load", "reset"):
+        if kind == "load_data" or (kind == "reset" and self.data is not None and "name" not in msg):
+            if kind == "load_data":
+                self.data = msg["circuit"]
+                self.name = str(msg.get("name", "result"))
+            self.circuit = Circuit.from_dict(self.data)
+        elif kind in ("load", "reset"):
             name = msg.get("name", self.name)
             self.circuit = load_circuit(name)
             self.name = name
+            self.data = None
         elif self.circuit is None:
             raise ValueError("load a circuit first")
         elif kind == "toggle":
@@ -150,6 +162,7 @@ class Training:
         self.gps = 10.0        # generations per second, 0 = as fast as possible
         self.show = "best"
         self.render_hz = 4.0
+        self.results: list[dict] = []  # every new best of the current run, for the Results tab
         self._wake = asyncio.Event()  # cuts the between-generations wait short on pause
 
     def configure(self, msg: dict) -> None:
@@ -170,10 +183,16 @@ class Training:
             if self.trainer is not None:
                 self.trainer.close()  # stop the old run's worker processes
             max_blocks = min(40, max(1, int(msg.get("max_blocks", 12))))
-            self.trainer = Trainer(task, max_blocks=max_blocks)
+            # "layout" (default) evolves layouts directly; "network" evolves a block-placing network.
+            cls = Trainer if msg.get("method") == "network" else LayoutTrainer
+            self.trainer = cls(task, max_blocks=max_blocks)
+            self.results = []
             self.start()
         elif kind == "train_config":
             self.configure(msg)
+        elif kind == "train_results":
+            await self.send_results()
+            return
         elif self.trainer is None:
             raise ValueError("start training first")
         elif kind == "train_pause":
@@ -218,6 +237,21 @@ class Training:
             "best_ever": {"gen": t.best_gen, "rows": t.best.result.rows_passed, "blocks": t.best.blocks,
                           "dims": t.best.dims, "delay": t.best.result.delay} if t and t.best else None,
         })
+
+    MAX_RESULTS = 50
+
+    def record(self, ind, gen: int) -> None:
+        """Keep a copy of a new best circuit for the Results tab."""
+        res = ind.result
+        self.results.append({
+            "id": (self.results[-1]["id"] + 1) if self.results else 1, "gen": gen,
+            "rows": res.rows_passed, "rows_total": self.trainer.n_rows, "blocks": ind.blocks,
+            "dims": ind.dims, "delay": res.delay, "circuit": ind.circuit.to_dict(include_state=False),
+        })
+        del self.results[:-self.MAX_RESULTS]
+
+    async def send_results(self) -> None:
+        await self.session.send({"type": "train_results", "results": self.results})
 
     async def send_circuit(self, ind, gen: int, kind: str) -> None:
         res = evaluate(ind.circuit, self.trainer.task, frames=True)
@@ -272,8 +306,12 @@ class Training:
                 batch = [await asyncio.to_thread(self.trainer.generation)]
             else:  # flat out: run generations back to back for a moment, then report
                 batch = await asyncio.to_thread(self._run_for, 0.05)
+            new_results = False
             for stats in batch:
                 pending.append(stats.to_dict())
+                if stats.new_best:
+                    self.record(stats.best, stats.gen)
+                    new_results = True
                 if self.wanted(stats):
                     candidate = stats
             now = time.monotonic()
@@ -283,6 +321,8 @@ class Training:
             if now - last_stats >= 0.1:
                 await self.send_progress(pending)
                 pending, last_stats = [], now
+            if new_results:
+                await self.send_results()
             wait = (1.0 / self.gps - (time.monotonic() - started)) if self.gps > 0 else 0.0
             try:  # also lets messages from the viewer in
                 await asyncio.wait_for(self._wake.wait(), max(0.0, wait))

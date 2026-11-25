@@ -261,6 +261,14 @@ export class CircuitView {
   private paneWorlds = Array.from({ length: 4 }, () => new THREE.Group());
   private multiArea: (() => Rect) | null = null;
   private paneSize = { w: 0, h: 0 };
+  /**
+   * Stretch handles: when set, coloured balls on the grid's sides can be dragged to resize it.
+   * ``onStretch(axis, side, cells)`` grows (cells > 0) or shrinks that side and returns how many
+   * cells it actually changed (after limits). side -1 is the low end (x = 0 or z = 0).
+   */
+  private stretch: ((axis: 0 | 1 | 2, side: 1 | -1, cells: number) => number) | null = null;
+  private handles = new THREE.Group();
+  private drag: { axis: 0 | 1 | 2; side: 1 | -1; origin: THREE.Vector3; dir: THREE.Vector3; applied: number; id: number } | null = null;
   /** Called with the pane index (0-3) when a pane is clicked in multi-view. */
   onPaneClick: ((pane: number) => void) | null = null;
 
@@ -275,7 +283,7 @@ export class CircuitView {
     const sun = new THREE.DirectionalLight(0xffffff, 1.6);
     sun.position.set(6, 12, 4);
     sun.castShadow = true;
-    this.scene.add(sun, this.world, this.floor, this.layerOutline);
+    this.scene.add(sun, this.world, this.floor, this.layerOutline, this.handles);
     for (const g of this.paneWorlds) {
       g.visible = false;
       this.scene.add(g);
@@ -296,16 +304,35 @@ export class CircuitView {
     let down: { x: number; y: number; button: number; moved: boolean } | null = null;
     const el = this.renderer.domElement;
     el.addEventListener("contextmenu", (e) => e.preventDefault());
+    // capture phase, so a press on a stretch handle runs before OrbitControls and can turn it off
     el.addEventListener("pointerdown", (e) => {
       down = { x: e.clientX, y: e.clientY, button: e.button, moved: false };
-    });
+      if (e.button === 0 && this.startStretch(e)) {
+        down = null;
+        this.controls.enabled = false;
+        el.setPointerCapture(e.pointerId);
+      }
+    }, { capture: true });
     el.addEventListener("pointermove", (e) => {
+      if (this.drag) return this.moveStretch(e);
+      if (this.stretch && !down) el.style.cursor = this.handleAt(e) ? "grab" : "";
       if (!down) return;
       // e.button >= 0 on a move means another button was pressed or released mid-gesture
       if (e.button >= 0 || Math.hypot(e.clientX - down.x, e.clientY - down.y) > 4) down.moved = true;
     });
-    el.addEventListener("pointercancel", () => (down = null));
+    const endStretch = () => {
+      if (!this.drag) return false;
+      this.drag = null;
+      this.controls.enabled = true;
+      el.style.cursor = "";
+      return true;
+    };
+    el.addEventListener("pointercancel", () => {
+      down = null;
+      endStretch();
+    });
     el.addEventListener("pointerup", (e) => {
+      if (endStretch()) return;
       const d = down;
       down = null;
       if (!d || d.moved || d.button !== e.button) return; // it was a drag or a multi-button gesture
@@ -414,6 +441,99 @@ export class CircuitView {
     this.world.visible = true;
   }
 
+  /** Show stretch handles on the grid (null hides them). */
+  setStretch(onStretch: ((axis: 0 | 1 | 2, side: 1 | -1, cells: number) => number) | null): void {
+    this.stretch = onStretch;
+    if (!onStretch) this.drag = null;
+    this.drawHandles();
+  }
+
+  private drawHandles(): void {
+    this.handles.clear();
+    if (!this.stretch || !this.size) return;
+    const [X, Y, Z] = this.size.split("x").map(Number);
+    const cx = (X - 1) / 2;
+    const cz = (Z - 1) / 2;
+    const gap = 0.75;
+    const spots: [0 | 1 | 2, 1 | -1, number, number, number, number][] = [
+      [0, 1, X - 0.5 + gap, 0.15, cz, 0xe5484d], [0, -1, -0.5 - gap, 0.15, cz, 0xe5484d],
+      [2, 1, cx, 0.15, Z - 0.5 + gap, 0x3e63dd], [2, -1, cx, 0.15, -0.5 - gap, 0x3e63dd],
+      [1, 1, cx, Y + 0.6, cz, 0x30a46c],
+    ];
+    for (const [axis, side, x, y, z, color] of spots) {
+      const ball = new THREE.Mesh(new THREE.SphereGeometry(0.2, 20, 14),
+        new THREE.MeshBasicMaterial({ color, depthTest: false, transparent: true, opacity: 0.95 }));
+      ball.renderOrder = 10; // stays visible behind blocks
+      ball.position.set(x, y, z);
+      ball.userData.stretch = { axis, side };
+      this.handles.add(ball);
+    }
+  }
+
+  private ray(e: PointerEvent): THREE.Ray {
+    const rect = this.renderer.domElement.getBoundingClientRect();
+    const ndc = new THREE.Vector2(((e.clientX - rect.left) / rect.width) * 2 - 1, -((e.clientY - rect.top) / rect.height) * 2 + 1);
+    this.raycaster.setFromCamera(ndc, this.camera);
+    return this.raycaster.ray;
+  }
+
+  private handleAt(e: PointerEvent): THREE.Object3D | null {
+    if (!this.stretch || this.multiArea || !this.handles.children.length) return null;
+    this.ray(e);
+    // generous hit radius: test a slightly bigger invisible sphere around each ball
+    let best: THREE.Object3D | null = null;
+    let bestD = Infinity;
+    for (const h of this.handles.children) {
+      const d = this.raycaster.ray.distanceSqToPoint(h.position);
+      if (d < 0.35 * 0.35 && d < bestD) [best, bestD] = [h, d];
+    }
+    return best;
+  }
+
+  /** Distance along the drag axis (outwards) of the point on it closest to the pointer ray. */
+  private along(e: PointerEvent): number | null {
+    const d = this.drag!;
+    const r = this.ray(e);
+    const w = d.origin.clone().sub(r.origin);
+    const b = d.dir.dot(r.direction);
+    const denom = 1 - b * b;
+    if (denom < 1e-4) return null; // looking straight down the axis
+    return (b * r.direction.dot(w) - d.dir.dot(w)) / denom;
+  }
+
+  private startStretch(e: PointerEvent): boolean {
+    const h = this.handleAt(e);
+    if (!h) return false;
+    const { axis, side } = h.userData.stretch;
+    const dir = new THREE.Vector3();
+    dir.setComponent(axis, side);
+    this.drag = { axis, side, origin: h.position.clone(), dir, applied: 0, id: e.pointerId };
+    const s = this.along(e);
+    if (s !== null) this.drag.origin.addScaledVector(dir, s); // measure from where the ball was grabbed
+    this.renderer.domElement.style.cursor = "grabbing";
+    return true;
+  }
+
+  private moveStretch(e: PointerEvent): void {
+    const d = this.drag!;
+    const s = this.along(e);
+    if (s === null || !this.stretch) return;
+    const want = Math.round(s);
+    if (want === d.applied) return;
+    const done = this.stretch(d.axis, d.side, want - d.applied);
+    if (!done) return;
+    d.applied += done;
+    if (d.side < 0) {
+      // the grid grew or shrank at its low end, so everything moved +done along the axis:
+      // move the camera and the drag line with it, so the grid seems to grow towards the pointer
+      const shift = new THREE.Vector3();
+      shift.setComponent(d.axis, done);
+      this.camera.position.add(shift);
+      this.controls.target.add(shift);
+      d.origin.add(shift);
+    }
+  }
+
   private pick(e: PointerEvent): [number, number, number] | null {
     const rect = this.renderer.domElement.getBoundingClientRect();
     const ndc = new THREE.Vector2(((e.clientX - rect.left) / rect.width) * 2 - 1, -((e.clientY - rect.top) / rect.height) * 2 + 1);
@@ -466,7 +586,7 @@ export class CircuitView {
     this.paneSize = { w: 0, h: 0 }; // multi-view re-fits on its next frame
   }
 
-  private frame(size: [number, number, number]): void {
+  private frame(size: [number, number, number], moveCamera = true): void {
     const [X, Y, Z] = size;
     this.floor.clear();
     const grid = new THREE.GridHelper(Math.max(X, Z) + 2, Math.max(X, Z) + 2, 0x3a3f4a, 0x262a32);
@@ -481,6 +601,7 @@ export class CircuitView {
     plate.position.set((X - 1) / 2, -0.001, (Z - 1) / 2);
     plate.receiveShadow = true;
     this.floor.add(plate);
+    if (!moveCamera) return;
     const centre = new THREE.Vector3((X - 1) / 2, Y / 2, (Z - 1) / 2);
     const dist = Math.max(X, Y, Z) * 1.1 + 2;
     this.camera.position.set(centre.x + dist * 0.5, centre.y + dist * 0.8, centre.z + dist);
@@ -491,8 +612,9 @@ export class CircuitView {
   private fit(size: [number, number, number]): void {
     const sizeKey = size.join("x");
     if (sizeKey !== this.size) {
-      this.frame(size);
+      this.frame(size, !this.drag); // stretching keeps the camera where it is
       this.size = sizeKey;
+      this.drawHandles();
     }
   }
 

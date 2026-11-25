@@ -162,8 +162,29 @@ def test_matching_signal_hint_points_at_the_right_input():
     assert 0 < blank < closer < 1        # B's signal grows towards the lamp
     c2 = task.blank_circuit()
     for x in (1, 2, 3):
-        c2.place((x, 0, 0), Block.DUST)  # A's signal does not count
-    assert evaluate(c2, task).match[0] == blank
+        c2.place((x, 0, 0), Block.DUST)  # A's signal is wrong in half the rows
+    c3 = task.blank_circuit()
+    for x in (1, 2, 3):
+        c3.place((x, 0, 4), Block.DUST)  # B's signal, just as far along
+    assert evaluate(c2, task).match[0] < evaluate(c3, task).match[0]
+
+
+def test_opposite_signal_counts_as_one_torch_away():
+    # For AND, a NAND signal next to the lamp is worth more than a lone A wire there.
+    from redspark.designer import matching_reach
+    import numpy as np
+    task = TruthTableTask.from_dict({
+        "size": [3, 1, 1], "inputs": [{"label": "A", "pos": [0, 0, 0]}],
+        "outputs": [{"label": "OUT1", "pos": [2, 0, 0]}],
+        "rows": [{"in": [a], "out": [a]} for a in (False, True)],
+    })
+    maps = [np.zeros((3, 1, 1), bool), np.zeros((3, 1, 1), bool)]
+    maps[0][1, 0, 0] = True          # cell next to the lamp carries NOT A
+    opposite = matching_reach(task, maps)[0]
+    maps = [np.zeros((3, 1, 1), bool), np.zeros((3, 1, 1), bool)]
+    maps[1][1, 0, 0] = True          # ...or exactly A
+    exact = matching_reach(task, maps)[0]
+    assert 0 < opposite < exact
 
 
 def test_stuck_population_starts_over_but_keeps_the_best():
@@ -195,3 +216,33 @@ def test_faster_circuit_wins_when_blocks_and_size_tie():
     assert dust.rows_passed == rep.rows_passed == 2
     assert 0 < dust.delay < rep.delay
     assert dust_key > rep_key
+
+
+def test_layout_trainer_solves_and_quickly():
+    import itertools
+    from redspark.designer import LayoutTrainer
+    rows = [{"in": list(c), "out": [c[0] and c[1]]} for c in itertools.product([False, True], repeat=2)]
+    task = TruthTableTask.from_dict({
+        "size": [7, 1, 5], "inputs": [{"label": "A", "pos": [0, 0, 0]}, {"label": "B", "pos": [0, 0, 4]}],
+        "outputs": [{"label": "OUT1", "pos": [6, 0, 2]}], "rows": rows})
+    tr = LayoutTrainer(task, seed=0, max_blocks=14, workers=0)
+    try:
+        for _ in range(300):
+            if tr.generation().best_rows == 4:
+                break
+        assert tr.best.result.rows_passed == 4
+        assert tr.best.circuit.count_blocks() - len(task.fixed) <= 14
+    finally:
+        tr.close()
+
+
+def test_layout_trainer_places_comparators():
+    from redspark.designer import LayoutTrainer
+    tr = LayoutTrainer(copy_b_task(), seed=3, max_blocks=10, workers=0)
+    seen = set()
+    for _ in range(40):
+        tr.generation()
+        for ind in tr.pop:
+            seen |= set(int(v) for v in np.unique(ind.lay.block))
+    tr.close()
+    assert int(Block.COMPARATOR) in seen

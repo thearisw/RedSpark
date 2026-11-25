@@ -57,14 +57,8 @@ export class TrainMode {
       const el = $<HTMLInputElement>(id);
       el.value = String(this.size[axis]);
       el.addEventListener("change", () => {
-        const v = Math.max(1, Math.min(axis === 1 ? 3 : 9, Math.round(Number(el.value) || 1)));
-        el.value = String(v);
-        this.size[axis] = v;
-        // drop anything that no longer fits
-        for (const m of [this.inputs, this.outputs])
-          for (const [k, p] of m) if (p[axis] >= v) m.delete(k);
-        this.layer = Math.min(this.layer, this.size[1] - 1);
-        this.edited();
+        this.resize(axis, Math.round(Number(el.value) || 1) - this.size[axis], 1);
+        el.value = String(this.size[axis]);
       });
     }
     $<HTMLSelectElement>("layer").addEventListener("change", (e) => {
@@ -119,6 +113,7 @@ export class TrainMode {
   }
 
   leave(): void {
+    this.view.setStretch(null);
     this.active = false;
     this.view.cellPicker = null;
     this.view.showLayer(null);
@@ -166,6 +161,7 @@ export class TrainMode {
 
   private drawPanes(): void {
     if (!this.active) return;
+    this.view.setStretch(null);
     this.view.showLayer(null);
     this.view.setMulti(this.paneArea);
     for (let i = 0; i < 4; i++) {
@@ -233,6 +229,30 @@ export class TrainMode {
     this.edited();
   }
 
+  /**
+   * Grow (cells > 0) or shrink one side of the grid; side -1 is the low end, which moves every
+   * input and output along. Anything that falls off the grid is removed. Returns the change made.
+   */
+  private resize(axis: 0 | 1 | 2, cells: number, side: 1 | -1): number {
+    const old = this.size[axis];
+    const v = Math.max(1, Math.min(axis === 1 ? 3 : 9, old + cells));
+    const change = v - old;
+    if (!change) return 0;
+    this.size[axis] = v;
+    const shift = side < 0 ? change : 0;
+    for (const m of [this.inputs, this.outputs])
+      for (const [k, p] of m) {
+        const q: Pos = [p[0], p[1], p[2]];
+        q[axis] += shift;
+        if (q[axis] < 0 || q[axis] >= v) m.delete(k);
+        else m.set(k, q);
+      }
+    this.layer = Math.min(this.layer, this.size[1] - 1);
+    $<HTMLInputElement>(["sizeX", "sizeY", "sizeZ"][axis]).value = String(v);
+    this.edited();
+    return change;
+  }
+
   private applyPreset(name: string): void {
     const fn = PRESETS[name];
     const needs = name.includes("B") ? 2 : 1;
@@ -272,6 +292,7 @@ export class TrainMode {
     ];
     this.view.show({ size: this.size, ticks: 0, blocks });
     this.view.showLayer(this.layer);
+    this.view.setStretch((axis, side, cells) => this.resize(axis, cells, side)); // drag handles resize the grid
     if (this.view.cellPicker) this.view.cellPicker.layer = this.layer;
     const layerSel = $<HTMLSelectElement>("layer");
     layerSel.innerHTML = Array.from({ length: this.size[1] }, (_, y) => `<option value="${y}">${y}</option>`).join("");
@@ -342,7 +363,8 @@ export class TrainMode {
     this.selected = null;
     $("taskNote").textContent = "";
     this.socket.send({
-      type: "train_start", task, max_blocks: Number($<HTMLInputElement>("maxBlocks").value), ...this.config(),
+      type: "train_start", task, max_blocks: Number($<HTMLInputElement>("maxBlocks").value),
+      method: $<HTMLSelectElement>("trainMethod").value, ...this.config(),
     });
   }
 
@@ -421,6 +443,7 @@ export class TrainMode {
     if (this.multi && this.panes.length) return this.drawPanes();
     const s = this.shown;
     if (!s || !this.active) return;
+    this.view.setStretch(null);
     this.view.setMulti(null);
     this.layoutPanes();
     const frame: CircuitState = s.frames[this.frameIdx % s.frames.length];
