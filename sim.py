@@ -35,7 +35,7 @@ Components
     * **Torch**: attached below or beside. Only blocks in
       ``SUPPORTS_WALL_TORCH`` / ``SUPPORTS_STANDING_TORCH`` (solid blocks and
       lamps) can hold one, plus the floor for standing torches. A torch whose
-      support is removed breaks off. Weak power 15 to all neighbours except
+      support is removed breaks off (see *Support* below). Weak power 15 to all neighbours except
       its attachment block, and strong power into the block above. It turns off
       2 gt after its attachment block is powered. 8 toggles within 60 gt burn
       it out, and it rechecks 160 gt later.
@@ -70,8 +70,15 @@ Quasi-connectivity
     neighbour signal. Because blocks only re-check on updates, those components
     can be "budded" (quasi-powered without noticing) exactly as in Java.
 
-Simplifications: dust and repeaters do not need a block underneath (the grid
-floor counts as support), and there are no observers or pistons
+Support
+    Dust, repeaters, comparators and standing torches need a block beneath
+    them, and wall torches need a block beside them. Which blocks count is data
+    (``SUPPORTS_BELOW``, ``SUPPORTS_WALL_TORCH``; for now solid blocks and
+    lamps), and the grid floor under y = 0 counts too. ``place`` refuses an
+    unsupported part, and a part whose support is removed or replaced breaks
+    off, which can cascade (dust on a block on a block...).
+
+Simplifications: there are no observers or pistons
 yet, nor containers for comparators to read. Coordinates are ``(x, y, z)`` with ``y`` up, +x = east and +z = south.
 """
 
@@ -122,10 +129,26 @@ EXTREMELY_HIGH, VERY_HIGH, HIGH, NORMAL = -3, -2, -1, 0
 CONDUCTORS = (Block.SOLID, Block.LAMP)
 
 # Placement support, kept as data so new blocks only need adding here.
-# A wall torch hangs on the side of one of these; a standing torch sits on top of one.
-SUPPORTS_WALL_TORCH = frozenset({Block.SOLID, Block.LAMP})
-SUPPORTS_STANDING_TORCH = frozenset({Block.SOLID, Block.LAMP})
-FLOOR_SUPPORTS_STANDING_TORCH = True  # the floor under y = 0 counts as a block
+# A wall torch hangs on the side of one of these. Dust, repeaters, comparators and
+# standing torches sit on top of one (``SUPPORTS_BELOW``). To let a new block hold
+# parts, add it to the sets below; to give a new part a support rule, add it to
+# ``SUPPORTS_BELOW``.
+SUPPORT_BLOCKS = frozenset({Block.SOLID, Block.LAMP})
+SUPPORTS_WALL_TORCH = SUPPORT_BLOCKS
+SUPPORTS_STANDING_TORCH = SUPPORT_BLOCKS
+SUPPORTS_DUST = SUPPORT_BLOCKS
+SUPPORTS_REPEATER = SUPPORT_BLOCKS
+SUPPORTS_COMPARATOR = SUPPORT_BLOCKS
+SUPPORTS_BELOW: dict[Block, frozenset] = {
+    Block.TORCH: SUPPORTS_STANDING_TORCH,  # standing torches only; wall torches use SUPPORTS_WALL_TORCH
+    Block.DUST: SUPPORTS_DUST,
+    Block.REPEATER: SUPPORTS_REPEATER,
+    Block.COMPARATOR: SUPPORTS_COMPARATOR,
+}
+FLOOR_IS_SUPPORT = True  # the floor under y = 0 counts as a block for everything above
+FLOOR_SUPPORTS_STANDING_TORCH = FLOOR_IS_SUPPORT  # older name, kept for callers
+# Every block that can hold some part: replacing one of these may break parts off.
+ALL_SUPPORTS = SUPPORTS_WALL_TORCH.union(*SUPPORTS_BELOW.values())
 
 Pos = tuple[int, int, int]
 
@@ -528,6 +551,8 @@ class Circuit:
         if kind == Block.TORCH and not self.can_support_torch(p, facing):
             raise ValueError(f"a torch at {p} needs a solid block or lamp to attach to "
                              f"(towards {FACING_NAMES[facing]})")
+        if kind in SUPPORTS_BELOW and kind != Block.TORCH and not self.has_support_below(p, kind):
+            raise ValueError(f"a {kind.name.lower()} at {p} needs a solid block or lamp beneath it")
         if kind in DIODES and facing not in HORIZONTAL:
             raise ValueError(f"a {kind.name.lower()} must face horizontally")
         if not 1 <= delay <= 4:
@@ -563,36 +588,63 @@ class Circuit:
             self.update_neighbors_at(add(p, old_state[0]))
         self.update_neighbors_at(p)
         self.neighbor_changed(p, p)  # the new block checks its own inputs
-        if kind not in SUPPORTS_WALL_TORCH | SUPPORTS_STANDING_TORCH:
-            self._drop_unsupported_torches(p)
+        if old in ALL_SUPPORTS:
+            self._drop_unsupported(p)
+
+    def has_support_below(self, p: Pos, kind: Block) -> bool:
+        """Whether the block under ``p`` (or the floor) can hold a ``kind`` standing on it."""
+        below = add(p, DOWN)
+        if below[1] < 0:
+            return FLOOR_IS_SUPPORT
+        return self.get(below) in SUPPORTS_BELOW.get(Block(kind), frozenset())
 
     def can_support_torch(self, p: Pos, facing: int) -> bool:
         """Whether a torch at ``p`` attached towards ``facing`` has something to hang on."""
         if facing == UP:
             return False
-        support = add(p, facing)
         if facing == DOWN:
-            if support[1] < 0:
-                return FLOOR_SUPPORTS_STANDING_TORCH
-            return self.get(support) in SUPPORTS_STANDING_TORCH
-        return self.get(support) in SUPPORTS_WALL_TORCH
+            return self.has_support_below(p, Block.TORCH)
+        return self.get(add(p, facing)) in SUPPORTS_WALL_TORCH
+
+    def is_supported(self, p: Pos) -> bool:
+        """Whether the part already at ``p`` still has what it needs to stay put."""
+        kind = self.get(p)
+        if kind == Block.TORCH:
+            return self.can_support_torch(p, int(self.facing[p]))
+        if kind in SUPPORTS_BELOW:
+            return self.has_support_below(p, kind)
+        return True
 
     def can_place(self, p: Pos, kind: Block, facing: int | None = None) -> bool:
         """Placement rules that the simulator enforces (training masks should use this)."""
         p = tuple(int(v) for v in p)
         if not self.in_bounds(p):
             return False
+        kind = Block(kind)
         if kind == Block.TORCH:
             return self.can_support_torch(p, DOWN if facing is None else facing)
+        if kind in SUPPORTS_BELOW:
+            return self.has_support_below(p, kind)
         return True
 
-    def _drop_unsupported_torches(self, p: Pos) -> None:
-        """Torches next to ``p`` that lost their support break off, as in Java."""
+    def _drop_unsupported(self, p: Pos) -> None:
+        """Parts resting on ``p`` that lost their support break off, as in Java.
+
+        A wall torch hangs on the side of ``p``; dust, diodes and standing torches
+        sit on top of it. Breaking a part is a normal removal, so it updates its
+        neighbours and can break further parts in turn.
+        """
         for d in VALUES_ORDER:
             q = add(p, d)
-            if self.get(q) == Block.TORCH and add(q, int(self.facing[q])) == p \
-                    and not self.can_support_torch(q, int(self.facing[q])):
+            kind = self.get(q)
+            if kind == Block.TORCH:
+                rests_on_p = add(q, int(self.facing[q])) == p
+            else:
+                rests_on_p = kind in SUPPORTS_BELOW and d == UP
+            if rests_on_p and not self.is_supported(q):
                 self.place(q, Block.AIR)
+
+    _drop_unsupported_torches = _drop_unsupported  # older name
 
     def remove(self, p: Pos) -> None:
         self.place(p, Block.AIR)
@@ -674,7 +726,12 @@ class Circuit:
     @classmethod
     def from_dict(cls, data: dict, settle: bool = True) -> "Circuit":
         c = cls(tuple(data["size"]))
-        for b in data["blocks"]:
+        # Lay blocks that hold other parts first, lowest first, so a saved part
+        # never arrives before what it rests on. Everything else keeps its order.
+        blocks = sorted(data["blocks"], key=lambda b: (
+            0 if Block[b["type"].upper()] in ALL_SUPPORTS else 1,
+            b["pos"][1] if Block[b["type"].upper()] in ALL_SUPPORTS else 0))
+        for b in blocks:
             kind = Block[b["type"].upper()]
             facing = FACING_NAMES.index(b["facing"]) if "facing" in b else None
             c.place(tuple(b["pos"]), kind, facing=facing, delay=b.get("delay", 1),
