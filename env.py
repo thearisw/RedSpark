@@ -14,7 +14,7 @@ import gymnasium as gym
 import numpy as np
 from gymnasium import spaces
 
-from .sim import Block, Circuit, DOWN, HORIZONTAL, add
+from .sim import Block, Circuit, DOWN, HORIZONTAL
 from .tasks import GATES, evaluate_gate
 
 # (block, facing) choices the agent can place. AIR means "clear this cell".
@@ -102,11 +102,8 @@ class RedstoneGateEnv(gym.Env):
         current = c.get(pos)
         if current == kind and (kind not in (Block.TORCH, Block.REPEATER) or c.facing[pos] == facing):
             return False  # would change nothing
-        if kind == Block.TORCH:
-            return c.can_support_torch(pos, facing)  # solid blocks and lamps (see sim.py)
-        if kind in (Block.DUST, Block.REPEATER, Block.COMPARATOR) and pos[1] > 0:
-            return c.is_conductor(add(pos, DOWN))  # needs a block underneath (y=0 sits on the floor)
-        return True
+        # Support rules live in the simulator (torches, dust, repeaters, comparators).
+        return c.can_place(pos, kind, facing)
 
     def action_masks(self) -> np.ndarray:
         mask = np.zeros(self.action_space.n, dtype=bool)

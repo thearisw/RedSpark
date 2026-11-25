@@ -167,6 +167,8 @@ class Training:
             task = TruthTableTask.from_dict(msg["task"])
             self.configure(msg)
             await self.stop()
+            if self.trainer is not None:
+                self.trainer.close()  # stop the old run's worker processes
             max_blocks = min(40, max(1, int(msg.get("max_blocks", 12))))
             self.trainer = Trainer(task, max_blocks=max_blocks)
             self.start()
@@ -238,6 +240,27 @@ class Training:
             return stats.new_best
         return stats.best_rows == self.trainer.n_rows
 
+    def _run_for(self, seconds: float) -> list:
+        """Run generations until ``seconds`` have passed or training is paused (in a thread)."""
+        end = time.monotonic() + seconds
+        batch = [self.trainer.generation()]
+        while self.running and time.monotonic() < end:
+            batch.append(self.trainer.generation())
+        return batch
+
+    async def shutdown(self) -> None:
+        """The viewer went away: stop training and its worker processes."""
+        self.running = False
+        self._wake.set()
+        if self.task is not None:
+            try:
+                await self.task
+            except Exception:
+                pass  # its last messages had nowhere to go
+            self.task = None
+        if self.trainer is not None:
+            self.trainer.close()
+
     async def loop(self) -> None:
         pending: list[dict] = []
         candidate = None
@@ -245,10 +268,14 @@ class Training:
         while self.running:
             self._wake.clear()
             started = time.monotonic()
-            stats = await asyncio.to_thread(self.trainer.generation)
-            pending.append(stats.to_dict())
-            if self.wanted(stats):
-                candidate = stats
+            if self.gps > 0:
+                batch = [await asyncio.to_thread(self.trainer.generation)]
+            else:  # flat out: run generations back to back for a moment, then report
+                batch = await asyncio.to_thread(self._run_for, 0.05)
+            for stats in batch:
+                pending.append(stats.to_dict())
+                if self.wanted(stats):
+                    candidate = stats
             now = time.monotonic()
             if candidate is not None and now - last_circuit >= 1.0 / self.render_hz:
                 await self.send_circuit(self.shown(candidate), candidate.gen, self.show)
@@ -285,7 +312,7 @@ async def websocket(ws: WebSocket) -> None:
     except WebSocketDisconnect:
         pass
     finally:
-        session.training.running = False
+        await session.training.shutdown()
 
 
 routes = [
