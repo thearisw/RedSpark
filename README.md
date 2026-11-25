@@ -50,11 +50,51 @@ Open the **Train** tab in the app to design your own task and watch a network le
 1. Set the grid size (width, depth, up to 3 layers high) and pick the layer to place on.
 2. With **Input** selected, click cells to add input levers (A to D). With **Output**, add output lamps (OUT1 to OUT4). **Erase** removes one.
 3. Fill the truth table on the right. Each output cell cycles 0, 1, or – (don't care). The preset menu fills OUT1 with NOT, AND, OR, XOR and so on.
-4. Press **Run**. Each generation, a population of 32 small neural networks each build a circuit block by block; the best are copied with small random changes into the next generation (a genetic algorithm over the network weights, in `redspark/designer.py`). It uses only NumPy, so it runs in the app without PyTorch.
+4. Pick a **Method** and press **Run**. The default, **Evolve layouts**, evolves circuits directly. The older **Evolve a network** method evolves small neural networks that build circuits block by block. Both are genetic algorithms in `redspark/designer.py` and use only NumPy, so they run in the app without PyTorch. How they search and how they score is described in the next section.
 
 Controls: **Speed** sets generations per second (or as fast as possible). **Show** picks which circuits get drawn: successes only (every row passes), new bests, or every generation. **Draw at most N circuits/s** caps redrawing, so "every generation" at full speed draws the latest generation a few times a second while the chart still records every one. The shown circuit steps through its truth-table rows, and the table marks each row passed or failed.
 
-The chart shows rows passed per generation for the best network and the population mean. Single-input tasks like NOT usually solve within a few dozen generations; if a run stalls, press **Restart** for a fresh population. Two-input gates often stall at 3 of 4 rows (for AND, "always off" already gets 3 rows), so give them a wider grid (the hand-built AND is 7 x 5) and more blocks. **Save best** writes the best circuit to `circuits/<name>.json`, which then appears in the View tab.
+The chart shows rows passed per generation for the best design and the population mean. Training never resets on its own, so a stuck run keeps its progress; press **Restart** if you want a fresh population. Single-input tasks like NOT solve within a few dozen generations. Two-input gates need room: on a one-layer 7 x 5 grid AND takes seconds to a minute (14 blocks), and XOR needs a bigger block budget (about 24). **Save best** writes the best circuit to `circuits/<name>.json`, which then appears in the View tab.
+
+## How the Train tab searches and scores
+
+### Evolve layouts (default)
+
+There is no neural network. Each individual in the population *is* a circuit layout, and every move follows the simulator's placement and support rules (see `LayoutTrainer` in `redspark/designer.py`).
+
+- **Population:** 48 layouts. The 8 best are kept unchanged each generation (elites); the other 40 slots are children.
+- **Choosing parents:** tournament selection. Three layouts are picked at random and the best of the three becomes a parent.
+- **Mutation:** a child is a copy of a parent with one edit most of the time, sometimes several (the count is geometric, mean about 1.8). Each edit is one of:
+  - **Building block (25%):** add a whole small piece in one move, such as a wire of 1 to 4 dust, a block with a torch on its far side, side or top (an inverter), a repeater into a block, or a lone repeater. A random single block rarely lines up into something useful, so these pieces are what make progress quick.
+  - **Add (25%):** place one legal block, 80% of the time next to an existing block so that signal paths grow.
+  - **Remove (22%):** delete a random block. Anything that rested on it breaks off, as in the simulator.
+  - **Change (28%):** swap a block for a different legal block, facing or comparator mode in the same cell.
+- **Crossover:** a quarter of children take the left part (or front part) of one parent and the rest from another, rebuilt so that the result is legal. Half of those are also mutated.
+- **Only new designs:** children that are copies of an elite or of each other are re-rolled, and every layout's score is cached.
+- **No resets:** the population is never thrown away. The best design so far always stays on screen.
+- **Comparators:** both compare and subtract mode are in the parts list.
+
+### Evolve a network (older)
+
+A one-hidden-layer network (32 tanh neurons) looks at the grid and picks the next block to place, or stops, until the block budget is used. The population is 32 networks (6 elites, Gaussian weight noise with sigma 0.08, children re-rolled if they build the same circuit as before). The network is much slower than the layout method for the same result, so it is kept mainly for comparison. It also does not reset.
+
+This setup is recommended for only basic logic gates, as large layouts are too complex to lay out a network.
+
+### How a circuit is scored
+
+Both methods rank circuits with the same function, `score_circuit`. The ranking key is compared one number at a time; the first difference decides:
+
+1. **Rows passed.** Each truth-table row is run by flipping the levers, letting the circuit settle, and checking every output lamp (don't-care cells accept anything). A row also fails if the circuit is still changing after the settle limit. More rows always beats fewer.
+2. **Fully correct circuits** (every row passes) are then ranked by, in order: fewer blocks, a smaller bounding box (volume), and a faster activation time (the game tick on which the slowest row's outputs stop changing). A correct circuit therefore always beats a wrong one, and among correct ones the smallest wins.
+3. **Not yet correct circuits** are ranked by a hint score between rows passed and block count, so that partial progress counts:
+   `hint = 0.4 x bits_right + 0.2 x reach + 0.4 x match - 0.5 if unstable`
+   - **bits_right:** the fraction of required output bits that are right, over all rows.
+   - **reach:** how close a cell that changes with the inputs gets to an output lamp (1 when it touches it, 0 when it is a full grid span away).
+   - **match:** how close the *right* signal gets to the lamp. For each cell, its on/off pattern across the rows is compared to the output column. The cell scores its closeness to the lamp times the squared fraction of rows it matches, and a cell with the exactly *opposite* pattern still counts at 85% because a single torch flips it (for AND, a NAND signal next to the lamp is one inverter away). The best cell counts in full and the best cell with a different signal counts at half, so building a second ingredient (for example both NOT A and NOT B for a NOR) is also progress.
+   - **unstable:** circuits that never settle lose 0.5.
+   Remaining ties go to fewer blocks.
+
+This is why "always off" does not trap AND any more: it passes 3 of 4 rows but has no signal near the lamp, so a design with 3 rows plus a useful signal near the output outranks it.
 
 ## The simulation model
 
@@ -116,7 +156,7 @@ redspark/
   tasks.py      truth tables and gate scoring
   env.py        Gymnasium environment
   train.py      MaskablePPO training script
-  designer.py   truth-table tasks and the in-app genetic trainer (NumPy only)
+  designer.py   truth-table tasks, scoring, and the in-app genetic trainers (layout search and network; NumPy only)
   server.py     Starlette + WebSocket backend (also serves the viewer)
   app.py        one-click launcher used by RedSpark.bat
   viewer/       built viewer (output of `npm run build` in web/)
