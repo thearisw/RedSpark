@@ -17,7 +17,10 @@
 - Example circuits: `circuits/make_examples.py` then run it to rewrite `circuits/*.json`
 
 ## Server / app
-- WebSocket messages, Train tab backend: `redspark/server.py` (`Session.handle`, `Training`)
+- WebSocket messages (protocol docstring), routes: `redspark/server.py`
+- Session / Train tab backend: `redspark/session.py` (`Session.handle`, `Training`; no Starlette, shared with the web demo)
+- Web demo (Pyodide): `redspark/browser.py`, `web/src/worker.ts`, `web/src/transport-worker.ts`; deployed by `.github/workflows/pages.yml` to redspark.ariswong.dev
+- Python that runs in the web demo must stay pure Python + NumPy (no threads, processes or shared memory at import time)
 - Launcher: `redspark/app.py`, `RedSpark.bat`
 - Deps: `pyproject.toml`
 
@@ -25,12 +28,13 @@
 - Block meshes, dust shape, clicks, panes/layers: `render.ts` (`buildBlock`, `mats`, `geo`, `CircuitView`)
 - Pixel textures: `textures.ts` (seeded, 16x16, nearest filter)
 - Train tab UI: `train.ts`, `chart.ts`, `web/index.html`
-- View tab, tabs, socket: `main.ts`, `net.ts`
+- View tab, tabs: `main.ts`; socket: `net.ts` re-exports `#transport` (`transport-ws.ts` for the app, `transport-worker.ts` for `build:static`, picked in `vite.config.ts`)
 - Message/block types: `types.ts` (keep in sync with `server.py` / `to_dict`)
 
 ## Build / test
 - After any `web/` change: `cd web && npm run build` writes `redspark/viewer/` (served by the app; commit it)
-- Tests: `python -m pytest` (`tests/test_sim.py`, `test_comparator.py`, `test_env.py`, `test_designer.py`, `test_server.py`)
+- Web demo: `npm run build:static` writes `web/dist/` (not committed; CI builds it), `npm run preview:static` serves it
+- Tests: `python -m pytest` (`tests/test_sim.py`, `test_comparator.py`, `test_env.py`, `test_designer.py`, `test_server.py`, `test_browser.py`)
 - Docs: `README.md`
 
 ## Gotchas

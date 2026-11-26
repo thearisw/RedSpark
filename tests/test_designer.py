@@ -297,3 +297,79 @@ def test_layout_trainer_wires_opposite_corners_quickly(out_y, height):
         if tr.best.result.rows_passed == 2:
             break
     assert tr.best.result.rows_passed == 2
+
+
+# ------------------------------------------------- shrinking after a solve
+def staircase_task():
+    return TruthTableTask.from_dict({
+        "size": [7, 3, 3], "inputs": [{"label": "A", "pos": [2, 0, 2]}],
+        "outputs": [{"label": "OUT1", "pos": [0, 2, 0]}],
+        "rows": [{"in": [False], "out": [True]}, {"in": [True], "out": [False]}]})
+
+
+def staircase_layout(task):
+    """A working NOT that inverts far from the lamp and climbs to it on a dust staircase (11 blocks).
+
+    The same gate fits in 5: a block two below the lamp, a torch on it, and dust from the lever.
+    """
+    from redspark.designer import Layout
+    D, S, T = Block.DUST, Block.SOLID, Block.TORCH
+    lay = Layout(task)
+    for p, kind, facing in [((3, 0, 2), D, 0), ((4, 0, 2), S, 0), ((5, 0, 2), T, 1), ((5, 0, 1), D, 0),
+                            ((5, 0, 0), D, 0), ((4, 0, 0), D, 0), ((3, 0, 0), D, 0), ((2, 0, 0), S, 0),
+                            ((2, 1, 0), D, 0), ((1, 1, 0), S, 0), ((1, 2, 0), D, 0)]:
+        assert lay.can_place(p, int(kind), facing)
+        lay.place(p, kind, facing)
+    return lay
+
+
+def test_prune_removes_blocks_the_circuit_works_without():
+    from redspark.designer import Layout, LayoutTrainer
+    task = not_task()
+    lay = Layout(task)
+    lay.place((1, 0, 1), Block.DUST, 0)
+    lay.place((2, 0, 1), Block.SOLID, 0)
+    lay.place((3, 0, 1), Block.TORCH, 1)
+    lay.place((2, 0, 0), Block.SOLID, 0)      # dead weight
+    lay.place((2, 0, 2), Block.SOLID, 0)
+    lay.place((3, 0, 2), Block.DUST, 0)       # dangling dust, still lit by the torch
+    tr = LayoutTrainer(task, seed=0, workers=0)
+    pruned = tr._prune(lay)
+    assert tr._n_blocks(pruned) == 3
+    assert evaluate(pruned.to_circuit(), task).rows_passed == 2
+    assert tr.simulated == 0 and tr.checked > 0  # pruning checks are not counted as samples
+
+
+def test_reroute_finds_torch_under_the_lamp():
+    """The rewrite needs 6 removals and 4 additions at once: single edits cannot make it."""
+    from redspark.designer import LayoutTrainer
+    task = staircase_task()
+    lay = staircase_layout(task)
+    tr = LayoutTrainer(task, seed=0, workers=0)
+    assert tr._passes(lay) and tr._n_blocks(tr._prune(lay)) == 11  # nothing to prune: it all matters
+    best = None
+    for _ in range(300):
+        r = tr._reroute(lay)
+        if r is not None and (best is None or tr._n_blocks(r) < tr._n_blocks(best)):
+            best = r
+    assert best is not None and tr._n_blocks(best) == 5
+    assert evaluate(best.to_circuit(), task).rows_passed == 2
+    assert best.get((0, 1, 0)) == Block.TORCH and best.get((0, 0, 0)) == Block.SOLID
+
+
+@pytest.mark.parametrize("seed", [0, 1, 2])
+def test_solved_population_keeps_shrinking(seed):
+    """Seeded with the staircase, training reaches the 5-block design within a few generations."""
+    from redspark.designer import Individual, LayoutTrainer
+    task = staircase_task()
+    tr = LayoutTrainer(task, seed=seed, workers=0, max_blocks=12)
+    tr.pop = [Individual(None, lay=staircase_layout(task))] + tr.pop[1:]
+    try:
+        for _ in range(20):
+            stats = tr.generation()
+            assert stats.samples == tr.samples
+            if tr.best.blocks == 5:
+                break
+        assert tr.best.result.rows_passed == 2 and tr.best.blocks == 5
+    finally:
+        tr.close()

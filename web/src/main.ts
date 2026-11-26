@@ -42,7 +42,7 @@ const train = new TrainMode(view, socket);
 const results = new ResultsPanel(view, socket);
 
 async function loadList(): Promise<void> {
-    const names: string[] = await (await fetch("/api/circuits")).json();
+    const names = await socket.listCircuits();
     const previous = select.value;
     select.innerHTML = names.map((n) => `<option value="${n}">${n.replace(/_/g, " ")}</option>`).join("");
     const fromUrl = new URLSearchParams(location.search).get("circuit") ?? "";

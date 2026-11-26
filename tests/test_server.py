@@ -53,8 +53,8 @@ NOT_TASK = {
 
 def test_websocket_training_streams_progress_and_caps_circuits(tmp_path, monkeypatch):
     import time
-    import redspark.server as server
-    monkeypatch.setattr(server, "CIRCUITS_DIR", tmp_path)
+    import redspark.session as session
+    monkeypatch.setattr(session, "CIRCUITS_DIR", tmp_path)  # where train_save writes
     with client.websocket_connect("/ws") as ws:
         ws.send_json({"type": "train_start", "task": NOT_TASK, "gps": 0, "show": "all", "render_hz": 2})
         started = time.monotonic()

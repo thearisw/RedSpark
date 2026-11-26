@@ -12,6 +12,12 @@ RedSpark has three parts that share one simulator:
 
 Everything (rules, visuals, circuits) is original. It is inspired by redstone logic but uses no game assets and is not a copy of any game's exact rules.
 
+## Try it in the browser
+
+**[redspark.ariswong.dev](https://redspark.ariswong.dev)** runs the full viewer, including the Train tab, with nothing to install. The same Python simulator and trainers run inside the page through [Pyodide](https://pyodide.org) (Python compiled to WebAssembly), so the first visit downloads about 10 MB and takes a few seconds. Training is single-threaded there, so the desktop app is faster for big tasks, and circuits saved from training last until you reload the page.
+
+To build it yourself: `cd web && npm run build:static`, then `npm run preview:static`. Pushing to `main` deploys it with `.github/workflows/pages.yml`.
+
 ## Open the app (Windows, one click)
 
 Double-click **`RedSpark.bat`**. The first run creates a Python environment and installs the few packages the viewer needs (about a minute). After that it opens straight away, in its own window. Close the window to quit.
@@ -70,6 +76,10 @@ There is no neural network. Each individual in the population *is* a circuit lay
   - **Remove (22%):** delete a random block. Anything that rested on it breaks off, as in the simulator.
   - **Change (28%):** swap a block for a different legal block, facing or comparator mode in the same cell.
 - **Crossover:** a quarter of children take the left part (or front part) of one parent and the rest from another, rebuilt so that the result is legal. Half of those are also mutated.
+- **Shrinking after a solve:** once a circuit passes every row, single edits often can't shrink it any more, because the smaller design is several blocks away and every halfway step breaks the circuit (a dust staircase up to a lamp, say, when a block under the lamp with a torch on top would do). So each generation, 6 children come from two extra moves on the working elites:
+  - **Prune:** delete every block the circuit still works without, repeated until nothing more can go. Each new best gets one full prune.
+  - **Reroute an output:** put a small driver at an output lamp (a torch under it standing on a block, a torch beside it on or hanging from a block, a repeater into it, or a plain wire), lay a wire into it from a cell that already carries the right signal (the opposite one for a torch), then prune away the old route. This is the multi-block rewrite in one move.
+  Their extra truth-table checks are counted separately from the sample count.
 - **Only new designs:** children that are copies of an elite or of each other are re-rolled, and every layout's score is cached.
 - **No resets:** the population is never thrown away. The best design so far always stays on screen.
 - **Comparators:** both compare and subtract mode are in the parts list.
@@ -157,7 +167,9 @@ redspark/
   env.py        Gymnasium environment
   train.py      MaskablePPO training script
   designer.py   truth-table tasks, scoring, and the in-app genetic trainers (layout search and network; NumPy only)
+  session.py    viewer session and Train tab backend (shared by the server and the web demo)
   server.py     Starlette + WebSocket backend (also serves the viewer)
+  browser.py    runs a session inside Pyodide for the web demo
   app.py        one-click launcher used by RedSpark.bat
   viewer/       built viewer (output of `npm run build` in web/)
 RedSpark.bat    double-click to open the app on Windows

@@ -19,7 +19,12 @@ import os
 import time
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
-from multiprocessing import get_context, shared_memory
+from multiprocessing import get_context
+
+try:
+    from multiprocessing import shared_memory
+except ImportError:  # Pyodide (web demo) has no shared memory; scoring then stays in-process
+    shared_memory = None
 
 import numpy as np
 
@@ -893,11 +898,16 @@ class LayoutTrainer:
         self.restarts = 0
         self.samples = 0    # designs scored (each new child counts once, cached or not)
         self.simulated = 0  # of those, the ones that were not in the cache and ran in the simulator
+        self.checked = 0    # extra simulations by the simplify moves (pruning checks), not samples
         self.workers = workers
         self._pool: _LayoutPool | None = None
         self._gen_times: list[float] = []
         self._cache: dict[bytes, tuple] = {}
         self._fixed = self.builder.fixed_mask
+        self._pattern_cache: dict[bytes, np.ndarray] = {}
+        self._pruned: set[bytes] = set()  # best layouts already pruned
+        # Once solved, this many children per generation come from the simplify moves.
+        self.simplify = max(2, self.population // 8)
         self.pop = self._random_population()
 
     # ------------------------------------------------------------ edits
@@ -1021,7 +1031,8 @@ class LayoutTrainer:
                 return
             lay.place(p, block, facing)
 
-    def _wire(self, lay: Layout, full: bool = False) -> None:
+    def _wire(self, lay: Layout, full: bool = False, start: Pos | None = None,
+              target: Pos | None = None, budget: int | None = None) -> bool:
         """Lay a dust run from an existing block towards an output, as one move.
 
         Single-block edits grow a wire one cell at a time, and each cell only
@@ -1034,21 +1045,30 @@ class LayoutTrainer:
         down to drop, and now and then a repeater to restore the
         signal. It stops at the target, at the block budget, or at an obstacle.
         ``full`` lays the whole way; otherwise a random number of steps.
+        ``start`` and ``target`` pin the route's ends (the simplify step wires a
+        chosen signal into a chosen cell), and ``budget`` overrides the block
+        budget. Returns whether the wire reached its target.
         """
-        targets = self._targets[int(self.rng.integers(len(self._targets)))]
+        if target is not None:
+            targets = [target]
+        else:
+            targets = self._targets[int(self.rng.integers(len(self._targets)))]
         if not targets:
-            return
+            return False
         T = np.array(targets)
-        cells = np.argwhere((lay.block != Block.AIR) & ~np.isin(lay.block, [Block.LAMP]))
-        if not len(cells):
-            return
-        dist = np.abs(cells[:, None, :] - T[None, :, :]).sum(axis=2).min(axis=1)
-        order = np.argsort(dist + self.rng.random(len(dist)))  # nearest first, ties at random
-        start = order[min(len(order) - 1, int(self.rng.geometric(0.5)) - 1)]
-        cur = tuple(int(v) for v in cells[start])
+        if start is None:
+            cells = np.argwhere((lay.block != Block.AIR) & ~np.isin(lay.block, [Block.LAMP]))
+            if not len(cells):
+                return False
+            dist = np.abs(cells[:, None, :] - T[None, :, :]).sum(axis=2).min(axis=1)
+            order = np.argsort(dist + self.rng.random(len(dist)))  # nearest first, ties at random
+            pick = order[min(len(order) - 1, int(self.rng.geometric(0.5)) - 1)]
+            start = tuple(int(v) for v in cells[pick])
+        cur = start
         t = targets[int(np.abs(T - np.array(cur)).sum(axis=1).argmin())]
         steps = 10 ** 6 if full else int(self.rng.integers(1, 9))
         size = self.task.size
+        limit = self.max_blocks if budget is None else budget
 
         def inside(p: Pos) -> bool:
             return all(0 <= p[i] < size[i] for i in range(3))
@@ -1058,7 +1078,7 @@ class LayoutTrainer:
                 return False
             if lay.get(p) == kind and (kind != Block.REPEATER or int(lay.facing[p]) == facing):
                 return True
-            if lay.get(p) != Block.AIR or self._n_blocks(lay) >= self.max_blocks:
+            if lay.get(p) != Block.AIR or self._n_blocks(lay) >= limit:
                 return False
             if not lay.can_place(p, int(kind), facing):
                 return False
@@ -1071,39 +1091,40 @@ class LayoutTrainer:
 
         for _ in range(steps):
             if cur == t:
-                return
+                return True
             dy = t[1] - cur[1]
             horiz = [d for d in HORIZONTAL if (DIRS[d][0] * (t[0] - cur[0]) > 0 or DIRS[d][2] * (t[2] - cur[2]) > 0)]
             if not horiz:
                 if dy == 0:
-                    return
+                    return False
                 horiz = list(HORIZONTAL)  # right under or over the target: step aside to climb or drop
             d = int(horiz[int(self.rng.integers(len(horiz)))])
             if lay.get(cur) == Block.REPEATER:
                 d = int(lay.facing[cur])  # a repeater only sends its signal straight ahead
             nxt = add(cur, d)
             if not inside(nxt):
-                return
+                return False
             h = abs(t[0] - cur[0]) + abs(t[2] - cur[2])
             # Climb late (a raised wire needs a support block under every dust), mostly.
             if dy > 0 and lay.get(cur) == Block.DUST and (h <= dy or self.rng.random() < 0.1):
                 if lay.get(nxt) in (Block.AIR, Block.SOLID) and put(nxt, Block.SOLID) and put(add(nxt, UP), Block.DUST):
                     cur = add(nxt, UP)
                     continue
-                return
+                return False
             if dy < 0 and lay.get(nxt) == Block.AIR and lay.get(cur) == Block.DUST:  # drop a layer
                 low = add(nxt, DOWN)
                 if footing(low) and put(low, Block.DUST):
                     cur = low
                     continue
-                return
+                return False
             if lay.get(nxt) == Block.DUST:
                 cur = nxt
                 continue
             kind = Block.REPEATER if self.rng.random() < 0.08 else Block.DUST
             if not (footing(nxt) and put(nxt, kind, d)):
-                return
+                return False
             cur = nxt
+        return cur == t
 
     def _mutate(self, lay: Layout) -> Layout:
         child = lay.copy()
@@ -1125,13 +1146,206 @@ class LayoutTrainer:
         picks = self.rng.integers(len(self.pop), size=3)
         return self.pop[int(min(picks))]  # pop is sorted best first
 
+    # --------------------------------------------------------- simplify
+    # Once a circuit works, single-block edits can no longer shrink some parts of
+    # it: replacing a staircase of dust (4-5 blocks) with "block under the lamp,
+    # torch on top, wire into the block" means removing several blocks and adding
+    # others in one go, and every halfway step breaks the circuit, so it scores far
+    # below the working one and dies out. These moves make such rewrites in one step.
+
+    def _passes(self, lay: Layout) -> bool:
+        fit = self._score_layout(lay, count=False)[1]
+        return fit[0] == self.n_rows and fit[1] == 1
+
+    def _prune(self, lay: Layout) -> Layout:
+        """Delete every block the circuit still works without (repeat until none can go).
+
+        ``lay`` must already pass every row. Removing a block also drops the parts
+        it was holding up, so a whole dead staircase can go with its bottom block.
+        """
+        lay = lay.copy()
+        changed = True
+        while changed:
+            changed = False
+            cells = [tuple(int(v) for v in c) for c in np.argwhere((lay.block != Block.AIR) & ~self._fixed)]
+            for i in self.rng.permutation(len(cells)):
+                p = cells[int(i)]
+                if lay.get(p) == Block.AIR:  # already fell off with an earlier removal
+                    continue
+                trial = lay.copy()
+                trial.place(p, Block.AIR, 0)
+                if self._passes(trial):
+                    lay, changed = trial, True
+        return lay
+
+    def _patterns(self, lay: Layout) -> np.ndarray | None:
+        """Per truth-table row, which cells give out a signal a new wire could carry on.
+
+        Shape (rows, *size). Only levers, lit torches, active repeaters and comparators,
+        and powered dust count: a wire laid next to them carries their signal.
+        """
+        key = layout(lay)
+        if key in self._pattern_cache:
+            return self._pattern_cache[key]
+        c = lay.to_circuit()
+        if c is None:
+            return None
+        sources = np.isin(c.block, [Block.LEVER, Block.TORCH, Block.REPEATER, Block.COMPARATOR, Block.DUST])
+        maps = []
+        for row in self.task.rows:
+            for p, value in zip(self.task.inputs.values(), row.inputs):
+                c.set_lever(p, value)
+            c.settle()
+            maps.append((c.state | (c.dust > 0)) & sources)
+        out = np.stack(maps)
+        if len(self._pattern_cache) > 64:
+            self._pattern_cache.clear()
+        self._pattern_cache[key] = out
+        return out
+
+    def _gadgets(self, o: Pos) -> list[tuple[list[tuple[Pos, Block, int]], Pos, bool]]:
+        """Small ways to drive the lamp at ``o``: (blocks to place, cell to wire into, inverts).
+
+        Inverting ones: a torch under the lamp standing on a block, a torch beside the
+        lamp hanging on a block, or a torch beside it standing on a block. The wire
+        goes into the block holding the torch. Plain ones: a repeater into the lamp,
+        or a wire straight to it.
+        """
+        size, out = self.task.size, []
+
+        def inside(p: Pos) -> bool:
+            return all(0 <= p[i] < size[i] for i in range(3))
+
+        def feeds(block: Pos, skip: Pos) -> list[Pos]:
+            """Cells a wire can come in from to power ``block`` (in line with it, so the dust points in)."""
+            cells = []
+            for d in HORIZONTAL:
+                q = add(block, d)
+                if q != skip and inside(q):
+                    cells.append(q)
+            top = add(block, UP)
+            if top != skip and inside(top):
+                cells.append(top)  # dust on top powers the block below it
+            return cells
+
+        below, base = add(o, DOWN), add(add(o, DOWN), DOWN)
+        if inside(base):
+            plan = [(base, Block.SOLID, 0), (below, Block.TORCH, DOWN)]
+            out += [(plan, q, True) for q in feeds(base, below)]
+        for d in HORIZONTAL:
+            t = add(o, d)
+            if not inside(t):
+                continue
+            hold = add(t, d)
+            if inside(hold):  # torch on the side of a block, beside the lamp
+                plan = [(hold, Block.SOLID, 0), (t, Block.TORCH, OPPOSITE[d])]
+                out += [(plan, q, True) for q in feeds(hold, t)]
+            under = add(t, DOWN)
+            if inside(under):  # torch standing on a block, beside the lamp
+                plan = [(under, Block.SOLID, 0), (t, Block.TORCH, DOWN)]
+                out += [(plan, q, True) for q in feeds(under, t)]
+            behind = add(t, d)
+            if inside(behind):  # repeater pointing into the lamp
+                out.append(([(t, Block.REPEATER, OPPOSITE[d])], behind, False))
+            if t not in self.task.fixed:  # or just a wire straight to the lamp
+                out.append(([], t, False))
+        return out
+
+    def _reroute(self, lay: Layout) -> Layout | None:
+        """Rewire one output a new, short way, then prune what is no longer needed.
+
+        Picks a small driver for the lamp (see _gadgets), places it (over whatever
+        was there), and lays a wire into it from a cell that already carries the
+        signal it needs: the output's own pattern for a repeater, the opposite one
+        for a torch. The old route still lights the lamp at that point, so the
+        circuit keeps working, and pruning then strips the old route away. Returns
+        None when the attempt does not give a working circuit.
+        """
+        pats = self._patterns(lay)
+        if pats is None:
+            return None
+        k = int(self.rng.integers(len(self.task.outputs)))
+        o = list(self.task.outputs.values())[k]
+        rows = [i for i, r in enumerate(self.task.rows) if r.outputs[k] is not None]
+        want = np.array([self.task.rows[i].outputs[k] for i in rows], dtype=bool)
+        if not rows or want.all() or not want.any():
+            return None
+        gadgets = self._gadgets(o)
+        if not gadgets:
+            return None
+        plan, feed, inverts = gadgets[int(self.rng.integers(len(gadgets)))]
+        need = ~want if inverts else want
+        sub = pats[rows]
+        match = np.all(sub == need[:, None, None, None], axis=0)
+        child = lay.copy()
+        spare = self.max_blocks + 6  # may go over budget for now: pruning brings it back down
+        for p, block, facing in plan:
+            if p in self.task.fixed:
+                return None
+            if child.get(p) != int(block) or (block == Block.TORCH and int(child.facing[p]) != facing):
+                if child.get(p) != Block.AIR:
+                    child.place(p, Block.AIR, 0)
+                if not child.can_place(p, int(block), facing):
+                    return None
+                child.place(p, block, facing)
+        if any(child.get(p) != int(block) for p, block, _ in plan):
+            return None
+        if feed in self.task.fixed:
+            return None
+        if child.get(feed) == Block.LEVER:
+            ok = True
+        else:
+            if child.get(feed) not in (Block.AIR, Block.DUST):
+                child.place(feed, Block.AIR, 0)
+            # Sources still standing after the gadget went in, nearest the feed cell first.
+            cells = np.argwhere(match & (child.block == lay.block) & (child.block != Block.AIR))
+            if not len(cells):
+                return None
+            dist = np.abs(cells - np.array(feed)).sum(axis=1)
+            order = np.argsort(dist + self.rng.random(len(dist)) * 2.0)
+            src = tuple(int(v) for v in cells[order[min(len(order) - 1, int(self.rng.geometric(0.6)) - 1)]])
+            # Wire in line with the block the gadget hangs on, so the dust points into it.
+            block_cell = plan[0][0] if plan else o
+            d = tuple(f - b for f, b in zip(feed, block_cell))
+            approach = (feed[0] + d[0], feed[1] + d[1], feed[2] + d[2])
+            inside = all(0 <= approach[i] < self.task.size[i] for i in range(3))
+            if d[1] == 0 and inside and approach not in self.task.fixed and self.rng.random() < 0.7:
+                ok = self._wire(child, full=True, start=src, target=approach, budget=spare)
+                if ok and child.get(feed) == Block.AIR:
+                    ok = feed[1] == 0 or child.get(add(feed, DOWN)) in BELOW_SUPPORT[Block.DUST]
+                    if ok:
+                        child.place(feed, Block.DUST, 0)
+            else:
+                ok = self._wire(child, full=True, start=src, target=feed, budget=spare)
+        if not ok or not self._passes(child):
+            return None
+        return self._prune(child)
+
+    def _simplify(self, solved: list[Individual], n: int) -> list[Layout]:
+        """Smaller working circuits made from the working ones: pruned, and rerouted."""
+        out = []
+        best = solved[0].lay
+        key = layout(best)
+        if key not in self._pruned:  # each new best gets one full prune
+            self._pruned.add(key)
+            out.append(self._prune(best))
+        for _ in range(n):
+            ind = solved[int(self.rng.integers(len(solved)))]
+            lay = self._reroute(ind.lay)
+            if lay is not None:
+                out.append(lay)
+        return out
+
     # ---------------------------------------------------------- scoring
-    def _score_layout(self, lay: Layout) -> tuple:
+    def _score_layout(self, lay: Layout, count: bool = True) -> tuple:
         key = layout(lay)
         cached = self._cache.get(key)
         if cached is None:
             cached = score_layout(self.task, lay)
-            self.simulated += 1
+            if count:
+                self.simulated += 1
+            else:
+                self.checked += 1
             self._cache[key] = cached
             if len(self._cache) > 50000:
                 self._cache.pop(next(iter(self._cache)))
@@ -1203,6 +1417,13 @@ class LayoutTrainer:
         # Next generation: elites, then children of tournament winners (new designs only).
         seen = {layout(i.lay) for i in self.pop[:self.elites]}
         children = []
+        if solved and self.simplify:
+            ok = [i for i in self.pop[:self.elites] if i.fitness[0] == self.n_rows and i.fitness[1] == 1]
+            for lay in self._simplify(ok, self.simplify):
+                key = layout(lay)
+                if key not in seen and len(children) < self.population - self.elites:
+                    seen.add(key)
+                    children.append(Individual(None, lay=lay))
         while len(children) < self.population - self.elites:
             for _ in range(6):
                 a = self._tournament()

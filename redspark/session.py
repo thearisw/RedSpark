@@ -1,0 +1,305 @@
+"""A viewer session: the loaded circuit, play state and truth-table training.
+
+Transport-agnostic: ``Session(send)`` takes a coroutine that delivers one JSON
+message to the viewer, and ``await session.handle(msg)`` processes one message
+from it. The message protocol is described in ``redspark/server.py``, which
+runs sessions over a WebSocket; ``redspark/browser.py`` runs one inside
+Pyodide for the static web demo.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import random
+import re
+import time
+from pathlib import Path
+from typing import Awaitable, Callable
+
+from .designer import LayoutTrainer, Trainer, TruthTableTask, evaluate
+from .sim import Block, Circuit
+
+CIRCUITS_DIR = Path(__file__).resolve().parents[1] / "circuits"
+
+
+def circuit_names() -> list[str]:
+    return sorted(p.stem for p in CIRCUITS_DIR.glob("*.json"))
+
+
+def load_circuit(name: str) -> Circuit:
+    if name not in circuit_names():  # also blocks path tricks like "../x"
+        raise KeyError(name)
+    return Circuit.from_dict(json.loads((CIRCUITS_DIR / f"{name}.json").read_text()))
+
+
+class Session:
+    def __init__(self, send: Callable[[dict], Awaitable[None]], threaded: bool = True):
+        self._send = send  # e.g. a WebSocket's send_json
+        # Run training generations in a worker thread (False in the browser, where
+        # there are no threads: they then run on the event loop between messages).
+        self.threaded = threaded
+        self.name: str | None = None
+        self.data: dict | None = None  # circuit loaded with "load_data", reloaded by "reset"
+        self.circuit: Circuit | None = None
+        self.playing = False
+        self.tps = 20.0
+        self._send_lock = asyncio.Lock()
+        self.training = Training(self)
+
+    async def send(self, msg: dict) -> None:
+        async with self._send_lock:  # the training task sends too
+            await self._send(msg)
+
+    async def send_state(self) -> None:
+        await self.send({"type": "state", "name": self.name, "playing": self.playing,
+                         "circuit": self.circuit.to_dict() if self.circuit else None})
+
+    async def offload(self, fn, *args):
+        if self.threaded:
+            return await asyncio.to_thread(fn, *args)
+        return fn(*args)
+
+    async def handle(self, msg: dict) -> None:
+        kind = msg.get("type")
+        if isinstance(kind, str) and kind.startswith("train_"):
+            self.playing = False
+            await self.training.handle(kind, msg)
+            return
+        if kind == "load_data" or (kind == "reset" and self.data is not None and "name" not in msg):
+            if kind == "load_data":
+                self.data = msg["circuit"]
+                self.name = str(msg.get("name", "result"))
+            self.circuit = Circuit.from_dict(self.data)
+        elif kind in ("load", "reset"):
+            name = msg.get("name", self.name)
+            self.circuit = load_circuit(name)
+            self.name = name
+            self.data = None
+        elif self.circuit is None:
+            raise ValueError("load a circuit first")
+        elif kind == "toggle":
+            pos = tuple(int(v) for v in msg["pos"])
+            kind = self.circuit.get(pos)
+            if kind == Block.LEVER:
+                self.circuit.toggle(pos)
+            elif kind == Block.COMPARATOR:  # clicking a comparator switches its mode
+                self.circuit.set_comparator_mode(pos, not self.circuit.subtract[pos])
+            else:
+                raise ValueError("only levers and comparators can be clicked")
+        elif kind == "step":
+            self.circuit.step()
+        elif kind == "play":
+            self.playing = bool(msg.get("on", True))
+            self.tps = min(60.0, max(0.5, float(msg.get("tps", self.tps))))
+        else:
+            raise ValueError(f"unknown message type {kind!r}")
+        await self.send_state()
+
+
+SHOW_MODES = ("success", "best", "all", "samples")
+
+
+class Training:
+    """Runs a Trainer generation by generation and streams the results.
+
+    Every generation's numbers are sent (batched about 10 times a second), but
+    circuits are sent at most ``render_hz`` times a second, so "show every
+    generation" at full speed never asks the viewer to draw thousands of
+    circuits. Generations in between still appear in the progress chart.
+
+    Show "samples" draws designs as they are tested, good or bad: each time a
+    circuit is due, one design picked at random from the latest generation's
+    new ones. Nothing extra is simulated for this beyond the circuit that is
+    drawn, so training runs just as fast; with 2x2 multi-view the four panes
+    are the four latest picks.
+    """
+
+    def __init__(self, session: Session):
+        self.session = session
+        self.trainer: Trainer | None = None
+        self.task: asyncio.Task | None = None
+        self.running = False
+        self.gps = 10.0        # generations per second, 0 = as fast as possible
+        self.show = "best"
+        self.render_hz = 4.0
+        self.results: list[dict] = []  # every new best of the current run, for the Results tab
+        self._wake = asyncio.Event()
+        self._rng = random.Random()  # picks which tested design to draw in "samples" mode  # cuts the between-generations wait short on pause
+
+    def configure(self, msg: dict) -> None:
+        if "gps" in msg:
+            self.gps = min(1000.0, max(0.0, float(msg["gps"])))
+        if "show" in msg:
+            if msg["show"] not in SHOW_MODES:
+                raise ValueError(f"show must be one of {SHOW_MODES}")
+            self.show = msg["show"]
+        if "render_hz" in msg:
+            self.render_hz = min(10.0, max(0.2, float(msg["render_hz"])))
+
+    async def handle(self, kind: str, msg: dict) -> None:
+        if kind == "train_start":
+            task = TruthTableTask.from_dict(msg["task"])
+            self.configure(msg)
+            await self.stop()
+            if self.trainer is not None:
+                self.trainer.close()  # stop the old run's worker processes
+            max_blocks = min(40, max(1, int(msg.get("max_blocks", 12))))
+            # "layout" (default) evolves layouts directly; "network" evolves a block-placing network.
+            cls = Trainer if msg.get("method") == "network" else LayoutTrainer
+            self.trainer = cls(task, max_blocks=max_blocks)
+            self.results = []
+            self.start()
+        elif kind == "train_config":
+            self.configure(msg)
+        elif kind == "train_results":
+            await self.send_results()
+            return
+        elif self.trainer is None:
+            raise ValueError("start training first")
+        elif kind == "train_pause":
+            await self.stop()
+        elif kind == "train_resume":
+            self.start()
+        elif kind == "train_show_best":
+            if self.trainer.best is not None:
+                await self.send_circuit(self.trainer.best, self.trainer.best_gen, "best_ever")
+        elif kind == "train_save":
+            await self.save(str(msg.get("name", "")))
+            return
+        else:
+            raise ValueError(f"unknown message type {kind!r}")
+        await self.send_progress([])
+
+    def start(self) -> None:
+        if not self.running:
+            self.running = True
+            self.task = asyncio.create_task(self.loop())
+
+    async def stop(self) -> None:
+        self.running = False
+        self._wake.set()
+        if self.task is not None:
+            await self.task  # finishes the generation in progress, then flushes
+            self.task = None
+
+    async def save(self, name: str) -> None:
+        if self.trainer.best is None:
+            raise ValueError("nothing trained yet")
+        name = re.sub(r"[^a-z0-9_]+", "_", name.lower()).strip("_")[:40] or "designed"
+        data = self.trainer.best.circuit.to_dict(include_state=False)
+        (CIRCUITS_DIR / f"{name}.json").write_text(json.dumps(data, indent=1) + "\n")
+        await self.session.send({"type": "saved", "name": name})
+
+    async def send_progress(self, stats: list[dict]) -> None:
+        t = self.trainer
+        await self.session.send({
+            "type": "train_progress", "running": self.running, "gen": t.gen if t else 0,
+            "rows_total": t.n_rows if t else 0, "stats": stats,
+            "max_blocks": t.max_blocks if t else None,
+            "samples": t.samples if t else 0, "simulated": getattr(t, "simulated", None) if t else None,
+            "best_ever": {"gen": t.best_gen, "rows": t.best.result.rows_passed, "blocks": t.best.blocks,
+                          "dims": t.best.dims, "delay": t.best.result.delay} if t and t.best else None,
+        })
+
+    MAX_RESULTS = 50
+
+    def record(self, ind, gen: int) -> None:
+        """Keep a copy of a new best circuit for the Results tab."""
+        res = ind.result
+        self.results.append({
+            "id": (self.results[-1]["id"] + 1) if self.results else 1, "gen": gen,
+            "rows": res.rows_passed, "rows_total": self.trainer.n_rows, "blocks": ind.blocks,
+            "dims": ind.dims, "delay": res.delay, "circuit": ind.circuit.to_dict(include_state=False),
+        })
+        del self.results[:-self.MAX_RESULTS]
+
+    async def send_results(self) -> None:
+        await self.session.send({"type": "train_results", "results": self.results})
+
+    async def send_circuit(self, ind, gen: int, kind: str, sample: int | None = None) -> None:
+        res = evaluate(ind.circuit, self.trainer.task, frames=True)
+        await self.session.send({
+            "type": "train_circuit", "gen": gen, "kind": kind, "sample": sample, "rows_passed": res.rows_passed,
+            "rows_total": len(res.passed), "passed": res.passed, "got": res.got,
+            "blocks": ind.blocks, "dims": ind.dims, "delay": res.delay, "frames": res.frames,
+        })
+
+    def shown(self, stats):
+        """(design to draw, its sample number or None). In "every generation" mode
+        the best of that generation's new designs (the kept elites would repeat the
+        same design), in "samples" mode a random one of them, otherwise the
+        generation's best."""
+        if self.show == "samples" and stats.fresh:
+            i = self._rng.randrange(len(stats.fresh))
+            return stats.fresh[i], stats.samples - len(stats.fresh) + i + 1
+        return (stats.newest if self.show == "all" else stats.best), None
+
+    async def send_shown(self, stats) -> None:
+        ind, sample = self.shown(stats)
+        await self.send_circuit(ind, stats.gen, self.show, sample)
+
+    def wanted(self, stats) -> bool:
+        if self.show in ("all", "samples"):
+            return True
+        if self.show == "best":
+            return stats.new_best
+        return stats.best_rows == self.trainer.n_rows
+
+    def _run_for(self, seconds: float) -> list:
+        """Run generations until ``seconds`` have passed or training is paused (in a thread)."""
+        end = time.monotonic() + seconds
+        batch = [self.trainer.generation()]
+        while self.running and time.monotonic() < end:
+            batch.append(self.trainer.generation())
+        return batch
+
+    async def shutdown(self) -> None:
+        """The viewer went away: stop training and its worker processes."""
+        self.running = False
+        self._wake.set()
+        if self.task is not None:
+            try:
+                await self.task
+            except Exception:
+                pass  # its last messages had nowhere to go
+            self.task = None
+        if self.trainer is not None:
+            self.trainer.close()
+
+    async def loop(self) -> None:
+        pending: list[dict] = []
+        candidate = None
+        last_stats = last_circuit = 0.0
+        while self.running:
+            self._wake.clear()
+            started = time.monotonic()
+            if self.gps > 0:
+                batch = [await self.session.offload(self.trainer.generation)]
+            else:  # flat out: run generations back to back for a moment, then report
+                batch = await self.session.offload(self._run_for, 0.05)
+            new_results = False
+            for stats in batch:
+                pending.append(stats.to_dict())
+                if stats.new_best:
+                    self.record(stats.best, stats.gen)
+                    new_results = True
+                if self.wanted(stats):
+                    candidate = stats
+            now = time.monotonic()
+            if candidate is not None and now - last_circuit >= 1.0 / self.render_hz:
+                await self.send_shown(candidate)
+                candidate, last_circuit = None, now
+            if now - last_stats >= 0.1:
+                await self.send_progress(pending)
+                pending, last_stats = [], now
+            if new_results:
+                await self.send_results()
+            wait = (1.0 / self.gps - (time.monotonic() - started)) if self.gps > 0 else 0.0
+            try:  # also lets messages from the viewer in
+                await asyncio.wait_for(self._wake.wait(), max(0.0, wait))
+            except asyncio.TimeoutError:
+                pass
+        if candidate is not None:
+            await self.send_shown(candidate)
+        await self.send_progress(pending)
