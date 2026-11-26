@@ -68,7 +68,7 @@ The chart shows rows passed per generation for the best design and the populatio
 
 There is no neural network. Each individual in the population *is* a circuit layout, and every move follows the simulator's placement and support rules (see `LayoutTrainer` in `redspark/designer.py`).
 
-- **Population:** 48 layouts. The 8 best are kept unchanged each generation (elites); the other 40 slots are children.
+- **Population:** 48 layouts. Random starting layouts have anywhere from the blocks a wire to the outputs needs up to the full block budget. The 8 best are kept unchanged each generation (elites); the other 40 slots are children.
 - **Choosing parents:** tournament selection. Three layouts are picked at random and the best of the three becomes a parent.
 - **Mutation:** a child is a copy of a parent with one edit most of the time, sometimes several (the count is geometric, mean about 1.8). Each edit is one of:
   - **Building block (25%):** add a whole small piece in one move, such as a wire of 1 to 4 dust, a block with a torch on its far side, side or top (an inverter), a repeater into a block, or a lone repeater. A random single block rarely lines up into something useful, so these pieces are what make progress quick.
@@ -96,13 +96,13 @@ Both methods rank circuits with the same function, `score_circuit`. The ranking 
 
 1. **Rows passed.** Each truth-table row is run by flipping the levers, letting the circuit settle, and checking every output lamp (don't-care cells accept anything). A row also fails if the circuit is still changing after the settle limit. More rows always beats fewer.
 2. **Fully correct circuits** (every row passes) are then ranked by, in order: fewer blocks, a smaller bounding box (volume), and a faster activation time (the game tick on which the slowest row's outputs stop changing). A correct circuit therefore always beats a wrong one, and among correct ones the smallest wins.
-3. **Not yet correct circuits** are ranked by a hint score between rows passed and block count, so that partial progress counts:
+3. **Not yet correct circuits** are ranked by rows passed and then a hint score, so that partial progress counts. Block count, bounding box and speed are ignored completely until a circuit passes every row, so the search can try big, spread-out designs while it looks for a first solution:
    `hint = 0.4 x bits_right + 0.2 x reach + 0.4 x match - 0.5 if unstable`
    - **bits_right:** the fraction of required output bits that are right, over all rows.
    - **reach:** how close a cell that changes with the inputs gets to an output lamp (1 when it touches it, 0 when it is a full grid span away).
    - **match:** how close the *right* signal gets to the lamp. For each cell, its on/off pattern across the rows is compared to the output column. The cell scores its closeness to the lamp times the squared fraction of rows it matches, and a cell with the exactly *opposite* pattern still counts at 85% because a single torch flips it (for AND, a NAND signal next to the lamp is one inverter away). The best cell counts in full and the best cell with a different signal counts at half, so building a second ingredient (for example both NOT A and NOT B for a NOR) is also progress.
    - **unstable:** circuits that never settle lose 0.5.
-   Remaining ties go to fewer blocks.
+   Remaining ties are not broken by size.
 
 This is why "always off" does not trap AND any more: it passes 3 of 4 rows but has no signal near the lamp, so a design with 3 rows plus a useful signal near the output outranks it.
 
@@ -147,16 +147,17 @@ For a torch or lever, `facing` points at the block it is attached to (`-y` = the
 - **Reward:** the change in truth-table score after each placement, then a bonus of +1 for a full solve (which ends the episode) minus 0.01 per block used.
 - **Gates:** `NOT`, `BUFFER`, `AND`, `OR`, `NAND`, `NOR`, `XOR` (see `redspark/tasks.py`).
 
+**Curriculum.** `python -m redspark.train --curriculum default --timesteps 60000` trains one network on NOT, then BUFFER, OR, AND and XOR, keeping the weights between stages (or pass your own order, such as `--curriculum NOT,OR,AND`). Every stage uses the same 5 x 1 x 5 grid with levers A and B, and one-input gates simply ignore B, so the network's inputs and outputs stay the same. `--timesteps` is the budget for each stage, and a stage ends early once 90% of the last 100 episodes are solved (`--advance-at`). Each stage saves `runs/curriculum/<gate>.zip` and `circuits/curriculum_<gate>.json`. This is command-line only: PyTorch does not run in the browser demo.
+
 Current results: NOT is solved reliably in about 40k steps (under a minute). The two-input gates are not solved yet with the default settings (OR reached 3/4 rows after 60k steps). That is the next thing to work on.
 
 ## Ideas for next steps
 
-1. **Curriculum:** NOT, then BUFFER, then OR, then AND, then XOR, reusing the trained weights.
-2. **A CNN policy** over the 3D grid instead of the flat MLP, so it learns "torch next to block" once instead of per cell.
-3. **More training throughput:** `SubprocVecEnv`, or port `sim.py` to Rust (PyO3 for training, WASM so the browser can run it too).
-4. **Watch training live:** have the server stream circuits from the current policy.
-5. **Editing in the viewer:** place and remove blocks with the mouse, then save the circuit.
-6. **Desktop app:** wrap the viewer with Tauri.
+1. **A CNN policy** over the 3D grid instead of the flat MLP, so it learns "torch next to block" once instead of per cell.
+2. **More training throughput:** `SubprocVecEnv`, or port `sim.py` to Rust (PyO3 for training, WASM so the browser can run it too).
+3. **Watch training live:** have the server stream circuits from the current policy.
+4. **Editing in the viewer:** place and remove blocks with the mouse, then save the circuit.
+5. **Desktop app:** wrap the viewer with Tauri.
 
 ## Layout
 

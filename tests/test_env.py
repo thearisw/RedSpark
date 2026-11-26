@@ -69,3 +69,32 @@ def test_mask_needs_a_block_beneath_parts_on_upper_layers():
     env.step(action_for(env, (2, 1, 1), Block.DUST))
     env.step(action_for(env, (2, 0, 1), Block.AIR))          # clearing the block drops the dust
     assert env.circuit.get((2, 1, 1)) == Block.AIR
+
+
+def test_curriculum_stages_share_spaces():
+    """With n_inputs=2 every gate uses one grid, so a curriculum can reuse the network."""
+    envs = [RedstoneGateEnv(g, n_inputs=2) for g in ("NOT", "BUFFER", "OR", "AND", "XOR")]
+    for env in envs:
+        assert env.observation_space == envs[0].observation_space
+        assert env.action_space == envs[0].action_space
+        assert set(env.inputs) == {"A", "B"}
+    check_env(envs[0], skip_render_check=True)
+
+
+def test_not_gate_on_two_lever_grid_ignores_b():
+    env = RedstoneGateEnv("NOT", n_inputs=2)  # 5 x 1 x 5, A at z=0, B at z=4, OUT at z=2
+    env.reset(seed=0)
+    # lever A -> dust -> block -> torch on its far side (facing points back at the block) -> dust -> lamp
+    steps = [((1, 0, 0), Block.DUST, 0), ((2, 0, 0), Block.SOLID, 0), ((3, 0, 0), Block.TORCH, 1),
+             ((4, 0, 0), Block.DUST, 0), ((4, 0, 1), Block.DUST, 0)]
+    info = {}
+    for pos, kind, facing in steps:
+        _, _, terminated, _, info = env.step(action_for(env, pos, kind, facing))
+        if terminated:
+            break
+    assert info["solved"]
+
+
+def test_n_inputs_must_cover_the_gate():
+    with pytest.raises(ValueError):
+        RedstoneGateEnv("AND", n_inputs=1)

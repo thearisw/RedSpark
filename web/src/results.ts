@@ -1,3 +1,4 @@
+import { setPlayIcon, setResetIcon } from "./icons";
 import type { SimSocket } from "./net";
 import type { CircuitView } from "./render";
 import type { ServerMessage, TrainResult } from "./types";
@@ -15,6 +16,8 @@ export class ResultsPanel {
   private playing = false;
 
   constructor(private view: CircuitView, private socket: SimSocket) {
+    setPlayIcon($("resPlay"), false);
+    setResetIcon($("resReset"));
     $("resPlay").addEventListener("click", () => this.socket.send({ type: "play", on: !this.playing, tps: this.tps() }));
     $("resStep").addEventListener("click", () => this.socket.send({ type: "step" }));
     $("resReset").addEventListener("click", () => this.socket.send({ type: "reset" }));
@@ -51,7 +54,7 @@ export class ResultsPanel {
     }
     if (msg.type === "state" && this.active) {
       this.playing = msg.playing;
-      $("resPlay").textContent = msg.playing ? "Pause" : "Play";
+      setPlayIcon($("resPlay"), msg.playing);
       if (msg.circuit && this.selected !== null) {
         this.view.show(msg.circuit);
         $("resTicks").textContent = String(msg.circuit.ticks);

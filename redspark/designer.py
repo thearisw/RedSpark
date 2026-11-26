@@ -259,9 +259,11 @@ def score_circuit(task: TruthTableTask, c: Circuit) -> tuple[tuple, Evaluation, 
     Correctness always comes first: rows passed. Among circuits that pass
     every row, fewer blocks wins, then the smaller bounding box, then the
     faster one (lower activation time, in game ticks). Circuits
-    that are not correct yet are ranked by hints instead (output bits right,
-    how close an input-driven signal gets to the outputs), so a small but
-    wrong circuit never beats a correct one.
+    that are not correct yet are ranked by correctness alone: rows passed, then
+    hints (output bits right, how close an input-driven signal gets to the
+    outputs). Block count, bounding box and speed play no part until every row
+    passes, so the search is free to try big, sprawling designs while it is
+    still looking for a first solution.
     """
     res = evaluate(c, task)
     blocks = c.count_blocks() - len(task.fixed)
@@ -275,7 +277,7 @@ def score_circuit(task: TruthTableTask, c: Circuit) -> tuple[tuple, Evaluation, 
     reach = float(np.mean(res.reach))
     match = float(np.mean(res.match))
     hint = 0.4 * bit_frac + 0.2 * reach + 0.4 * match - (0.5 if not res.stable else 0.0)
-    return (res.rows_passed, 0, hint, -blocks, 0), res, blocks, volume
+    return (res.rows_passed, 0, hint, 0, 0), res, blocks, volume  # no size terms before solving
 
 
 # ------------------------------------------------------------------- layout
@@ -862,7 +864,8 @@ class LayoutTrainer:
     sometimes it takes one part of the grid from a second parent (crossover).
     Every edit follows the simulator's placement rules. Ranking is the same as
     the network trainer's (score_circuit): rows correct first, with hints for
-    getting closer, then fewer blocks, smaller size and faster activation.
+    getting closer (size ignored), then, once solved, fewer blocks, smaller
+    size and faster activation.
 
     Same interface as Trainer: call generation(); read best, best_gen, gen.
     """
@@ -886,6 +889,7 @@ class LayoutTrainer:
         need = wire_blocks(task)
         self._wire_rate = 0.15 * float(np.clip((need - 4) / 6, 0.0, 1.0)) if need >= 6 else 0.0
         self._wire_seed = need >= 6
+        self._min_blocks = need
         self.n_rows = len(task.rows)
         self.gen = 0
         self.best: Individual | None = None
@@ -917,7 +921,10 @@ class LayoutTrainer:
             lay = Layout(self.task)
             if self._wire_seed and k % 4 == 0:  # far apart: a quarter start with a wire laid from an input towards an output
                 self._wire(lay, full=True)
-            for _ in range(int(self.rng.integers(1, max(2, self.max_blocks // 2) + 1))):
+            # Any size from what a wire needs up to the full budget: before a solution,
+            # size is not scored, so don't bias the starting designs towards small ones.
+            lo = max(1, min(self._min_blocks, self.max_blocks))
+            for _ in range(int(self.rng.integers(lo, self.max_blocks + 1))):
                 if self._n_blocks(lay) >= self.max_blocks:
                     break
                 self._add(lay)

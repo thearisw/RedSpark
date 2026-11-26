@@ -1,5 +1,6 @@
 import { SimSocket } from "./net";
 import { CircuitView } from "./render";
+import { setPlayIcon, setResetIcon } from "./icons";
 import { ResultsPanel } from "./results";
 import { TrainMode } from "./train";
 import type { ServerMessage } from "./types";
@@ -10,6 +11,8 @@ const playBtn = $<HTMLButtonElement>("play");
 const tps = $<HTMLInputElement>("tps");
 const statusEl = $("status");
 let playing = false;
+setPlayIcon(playBtn, false);
+setResetIcon($("reset"));
 
 const setStatus = (text: string, isError = false) => {
   statusEl.textContent = text;
@@ -26,7 +29,7 @@ const socket = new SimSocket(
     if (msg.type !== "state") return;
     playing = msg.playing;
     if (train.active) return; // the train tab owns the 3D view
-    playBtn.textContent = playing ? "Pause" : "Play";
+    setPlayIcon(playBtn, playing);
     if (msg.circuit) {
       view.show(msg.circuit);
       $("ticks").textContent = String(msg.circuit.ticks);

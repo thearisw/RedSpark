@@ -373,3 +373,33 @@ def test_solved_population_keeps_shrinking(seed):
         assert tr.best.result.rows_passed == 2 and tr.best.blocks == 5
     finally:
         tr.close()
+
+
+def test_size_is_ignored_until_every_row_passes():
+    """Before a solution, extra blocks or a bigger box must not change the ranking."""
+    task = TruthTableTask.from_dict({
+        "size": [7, 1, 3],
+        "inputs": [{"label": "A", "pos": [0, 0, 1]}],
+        "outputs": [{"label": "OUT1", "pos": [4, 0, 1]}],
+        "rows": [{"in": [False], "out": [True]}, {"in": [True], "out": [False]}],
+    })
+    trainer = Trainer(task, seed=0)
+
+    def key(extra):
+        c = task.blank_circuit()
+        for pos, kind, facing in extra:
+            c.place(pos, kind, facing=facing)
+        return trainer.fitness(c)[0]
+
+    wrong = key([((1, 0, 1), Block.DUST, 0)])
+    wrong_padded = key([((1, 0, 1), Block.DUST, 0), ((6, 0, 0), Block.SOLID, 0), ((6, 0, 2), Block.SOLID, 0)])
+    assert wrong[0] < len(task.rows)
+    assert wrong == wrong_padded  # same correctness: no penalty for more blocks or a bigger box
+
+
+def test_random_start_layouts_are_not_biased_small():
+    from redspark.designer import LayoutTrainer
+    tr = LayoutTrainer(not_task(), seed=0, max_blocks=12, workers=0)
+    sizes = [tr._n_blocks(ind.lay) for ind in tr.pop]
+    assert max(sizes) > 12 // 2  # old start: at most half the budget
+    assert all(s <= tr.max_blocks for s in sizes)

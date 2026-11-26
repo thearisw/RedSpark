@@ -1,0 +1,190 @@
+{
+ "size": [
+  5,
+  1,
+  5
+ ],
+ "ticks": 0,
+ "blocks": [
+  {
+   "pos": [
+    0,
+    0,
+    0
+   ],
+   "type": "lever",
+   "facing": "-y",
+   "on": false,
+   "label": "A"
+  },
+  {
+   "pos": [
+    0,
+    0,
+    1
+   ],
+   "type": "repeater",
+   "facing": "+z",
+   "delay": 1
+  },
+  {
+   "pos": [
+    0,
+    0,
+    2
+   ],
+   "type": "repeater",
+   "facing": "+z",
+   "delay": 1
+  },
+  {
+   "pos": [
+    0,
+    0,
+    4
+   ],
+   "type": "lever",
+   "facing": "-y",
+   "on": false,
+   "label": "B"
+  },
+  {
+   "pos": [
+    1,
+    0,
+    0
+   ],
+   "type": "dust"
+  },
+  {
+   "pos": [
+    1,
+    0,
+    1
+   ],
+   "type": "repeater",
+   "facing": "+x",
+   "delay": 1
+  },
+  {
+   "pos": [
+    1,
+    0,
+    3
+   ],
+   "type": "dust"
+  },
+  {
+   "pos": [
+    2,
+    0,
+    0
+   ],
+   "type": "solid"
+  },
+  {
+   "pos": [
+    2,
+    0,
+    1
+   ],
+   "type": "repeater",
+   "facing": "-z",
+   "delay": 1
+  },
+  {
+   "pos": [
+    2,
+    0,
+    2
+   ],
+   "type": "dust"
+  },
+  {
+   "pos": [
+    2,
+    0,
+    4
+   ],
+   "type": "repeater",
+   "facing": "+x",
+   "delay": 1
+  },
+  {
+   "pos": [
+    3,
+    0,
+    0
+   ],
+   "type": "repeater",
+   "facing": "+x",
+   "delay": 1
+  },
+  {
+   "pos": [
+    3,
+    0,
+    1
+   ],
+   "type": "repeater",
+   "facing": "+z",
+   "delay": 1
+  },
+  {
+   "pos": [
+    3,
+    0,
+    3
+   ],
+   "type": "repeater",
+   "facing": "+x",
+   "delay": 1
+  },
+  {
+   "pos": [
+    4,
+    0,
+    0
+   ],
+   "type": "dust"
+  },
+  {
+   "pos": [
+    4,
+    0,
+    1
+   ],
+   "type": "repeater",
+   "facing": "+z",
+   "delay": 1
+  },
+  {
+   "pos": [
+    4,
+    0,
+    2
+   ],
+   "type": "lamp",
+   "label": "OUT"
+  },
+  {
+   "pos": [
+    4,
+    0,
+    3
+   ],
+   "type": "torch",
+   "facing": "-z"
+  },
+  {
+   "pos": [
+    4,
+    0,
+    4
+   ],
+   "type": "repeater",
+   "facing": "+z",
+   "delay": 1
+  }
+ ]
+}

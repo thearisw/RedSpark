@@ -63,6 +63,8 @@
         background: rgba(20, 22, 28, 0.9); border: 1px solid #2c3038; border-radius: 6px; padding: 4px 10px; }
       #homeView:hover { border-color: #ffb347; }
       #side { max-height: calc(100% - 180px); } /* leave the bottom-right corner to the viewcube */
+      .panel button.icon { display: inline-flex; align-items: center; justify-content: center; align-self: stretch; color: #3a3a3a; }
+      .panel button.icon svg { display: block; }
       [hidden] { display: none !important; }
     </style>
   </head>
@@ -75,9 +77,9 @@
       <div id="viewMode">
         <select id="circuit"></select>
         <div class="row">
-          <button id="play">Play</button>
+          <button id="play" aria-label="Play" title="Play">Play</button>
           <button id="step">Step</button>
-          <button id="reset">Reset</button>
+          <button id="reset" aria-label="Reset" title="Reset">Reset</button>
         </div>
         <label>Speed <input id="tps" type="range" min="1" max="20" value="20" /> <span id="tpsLabel">20</span> ticks/s</label>
         <div>Game tick <span id="ticks">0</span> <span class="muted">(20 per second, 2 per redstone tick)</span></div>
@@ -95,9 +97,9 @@
             <h2>View mode</h2>
             <div id="resCaption" class="muted"></div>
             <div class="row">
-              <button id="resPlay">Play</button>
+              <button id="resPlay" aria-label="Play" title="Play">Play</button>
               <button id="resStep">Step</button>
-              <button id="resReset">Reset</button>
+              <button id="resReset" aria-label="Reset" title="Reset">Reset</button>
             </div>
             <label>Speed <input id="resTps" type="range" min="1" max="20" value="20" /> <span id="resTpsLabel">20</span> ticks/s</label>
             <div>Game tick <span id="resTicks">0</span></div>

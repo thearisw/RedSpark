@@ -12,7 +12,7 @@
 ## Tasks / training
 - Gates, truth-table scoring: `redspark/tasks.py` (`GATES`, `evaluate_gate`)
 - PPO env, action mask, obs: `redspark/env.py` (`PLACEABLE`, `COMPARATOR_CHOICES`, `_valid`, `action_masks`)
-- PPO script, CLI flags: `redspark/train.py`
+- PPO script, CLI flags, curriculum (`--curriculum`, `train_curriculum`, `StopWhenSolved`): `redspark/train.py`; `env.py` `n_inputs` keeps stages on one grid
 - GA trainer (Train tab): `redspark/designer.py` (`PLACEABLE`, `Layout.supported`, `Builder.mask`, `Trainer`)
 - Example circuits: `circuits/make_examples.py` then run it to rewrite `circuits/*.json`
 

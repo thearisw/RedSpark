@@ -31,8 +31,8 @@ def default_size(gate: str) -> tuple[int, int, int]:
     return (5, 1, 3) if GATES[gate][0] == 1 else (5, 1, 5)
 
 
-def io_layout(gate: str, size: tuple[int, int, int]) -> tuple[dict[str, tuple], tuple]:
-    n_inputs = GATES[gate][0]
+def io_layout(gate: str, size: tuple[int, int, int], n_inputs: int | None = None) -> tuple[dict[str, tuple], tuple]:
+    n_inputs = n_inputs or GATES[gate][0]
     X, _, Z = size
     if n_inputs == 1:
         inputs = {"A": (0, 0, Z // 2)}
@@ -47,11 +47,15 @@ class RedstoneGateEnv(gym.Env):
     def __init__(self, gate: str = "NOT", size: tuple[int, int, int] | None = None,
                  max_steps: int = 16, block_cost: float = 0.01, solve_bonus: float = 1.0,
                  invalid_penalty: float = 0.02, render_mode: str | None = None,
-                 allow_comparators: bool = False):
+                 allow_comparators: bool = False, n_inputs: int | None = None):
         if gate not in GATES:
             raise ValueError(f"unknown gate {gate}; choose from {sorted(GATES)}")
+        # n_inputs: levers to place. More than the gate uses is allowed (the extra ones stay
+        # off), so a curriculum can keep one grid and action space for every stage.
+        if n_inputs is not None and not GATES[gate][0] <= n_inputs <= 2:
+            raise ValueError(f"{gate} needs {GATES[gate][0]} input(s); n_inputs must be that to 2")
         self.gate = gate
-        self.size = tuple(size or default_size(gate))
+        self.size = tuple(size or default_size(gate if n_inputs != 2 else "AND"))
         self.max_steps = max_steps
         self.block_cost = block_cost
         self.solve_bonus = solve_bonus
@@ -59,7 +63,7 @@ class RedstoneGateEnv(gym.Env):
         self.render_mode = render_mode
         # Comparators are opt-in so existing runs keep the same action space.
         self.placeable = PLACEABLE + (COMPARATOR_CHOICES if allow_comparators else [])
-        self.inputs, self.output = io_layout(gate, self.size)
+        self.inputs, self.output = io_layout(gate, self.size, n_inputs)
         self.fixed = set(self.inputs.values()) | {self.output}
 
         self.n_cells = int(np.prod(self.size))
