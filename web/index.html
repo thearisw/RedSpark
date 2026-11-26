@@ -121,8 +121,8 @@
         <div class="row"><label>Max blocks</label><input id="maxBlocks" type="number" min="1" max="40" value="12" /></div>
         <div class="row"><label>Method</label><select id="trainMethod" title="How new designs are made"><option value="layout" selected>Evolve layouts (fast)</option><option value="network">Evolve a network (old)</option></select></div>
         <div class="row">
-          <button id="run">Run</button>
-          <button id="restart" title="Stop and throw away this population. Run then starts from scratch.">Reset</button>
+          <button id="run" aria-label="Run training" title="Run training">Run</button>
+          <button id="restart" aria-label="Delete this population and start over" title="Delete this population and start over">Reset</button>
         </div>
         <div class="row"><label>Speed</label>
           <select id="gps">

@@ -2,6 +2,7 @@ import { ProgressChart } from "./chart";
 import type { SimSocket } from "./net";
 import type { CircuitView } from "./render";
 import type { BlockState, CircuitState, ServerMessage, ShowMode } from "./types";
+import { setIcon } from "./icons";
 
 type Pos = [number, number, number];
 type Out = boolean | null; // null = don't care
@@ -78,6 +79,8 @@ export class TrainMode {
       preset.value = "";
     });
 
+    setIcon($("run"), "play", "Run training");
+    setIcon($("restart"), "trash", "Delete this population and start over");
     $("run").addEventListener("click", () => this.toggleRun());
     $("restart").addEventListener("click", () => this.reset());
     $("showBest").addEventListener("click", () => socket.send({ type: "train_show_best" }));
@@ -199,7 +202,7 @@ export class TrainMode {
   disconnected(): void {
     this.running = false;
     this.startedTask = null;
-    $("run").textContent = "Run";
+    setIcon($("run"), "play", "Run training");
   }
 
   // ---------------------------------------------------------------- editing
@@ -395,7 +398,7 @@ export class TrainMode {
     $("gen").textContent = "0";
     $("samples").textContent = "0";
     this.rate = [];
-    $("run").textContent = "Run";
+    setIcon($("run"), "play", "Run training");
     $("taskNote").textContent = "";
     this.renderTable();
     this.showEditor();
@@ -404,7 +407,7 @@ export class TrainMode {
 
   private toggleRun(): void {
     if (this.running) {
-      $("run").textContent = "Pausing…";
+      setIcon($("run"), "pause", "Pausing…");
       return this.socket.send({ type: "train_pause" });
     }
     if (this.startedTask === JSON.stringify(this.task())) this.socket.send({ type: "train_resume", ...this.config() });
@@ -416,7 +419,8 @@ export class TrainMode {
       if (this.startedTask === null) return true; // left over from a run that was reset
       if (this.running && !msg.running) this.status(`Paused at generation ${msg.gen}.`);
       this.running = msg.running;
-      $("run").textContent = msg.running ? "Pause" : "Run";
+      if (msg.running) setIcon($("run"), "pause", "Pause training");
+      else setIcon($("run"), "play", "Run training");
       this.chart.add(msg.stats);
       const last = msg.stats[msg.stats.length - 1];
       const restarts = msg.stats.filter((x) => x.restarted).length;

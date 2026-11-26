@@ -6,13 +6,16 @@ const svg = (body: string) =>
 const ICONS = {
   play: svg(`<path d="M4 2.5v11l9-5.5z" fill="currentColor"/>`),
   pause: svg(`<rect x="3.5" y="2.5" width="3" height="11" rx="0.5" fill="currentColor"/><rect x="9.5" y="2.5" width="3" height="11" rx="0.5" fill="currentColor"/>`),
+  trash: svg(
+    `<path d="M2.5 4h11M6 4V2.5h4V4M4 4l.7 9.5h6.6L12 4M6.8 6.5v5M9.2 6.5v5" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>`,
+  ),
   reset: svg(
     `<path d="M3.5 8a4.5 4.5 0 1 0 1.4-3.3" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>` +
       `<path d="M2.5 1.8v3.9h3.9z" fill="currentColor"/>`,
   ),
 };
 
-function setIcon(btn: HTMLElement, icon: keyof typeof ICONS, label: string): void {
+export function setIcon(btn: HTMLElement, icon: keyof typeof ICONS, label: string): void {
   btn.innerHTML = ICONS[icon];
   btn.classList.add("icon");
   btn.setAttribute("aria-label", label);
