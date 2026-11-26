@@ -267,3 +267,33 @@ def test_layout_trainer_counts_samples_and_cache_hits():
         assert stats.to_dict()["samples"] == total
     finally:
         tr.close()
+
+
+def corner_task(out_y=0, height=1):
+    return TruthTableTask.from_dict({
+        "size": [9, height, 9], "inputs": [{"label": "B", "pos": [0, 0, 0]}],
+        "outputs": [{"label": "OUT1", "pos": [8, out_y, 8]}],
+        "rows": [{"in": [False], "out": [False]}, {"in": [True], "out": [True]}]})
+
+
+def test_block_budget_grows_to_fit_a_wire_to_far_outputs():
+    from redspark.designer import LayoutTrainer, wire_blocks
+    task = corner_task()
+    assert wire_blocks(task) == 15  # 16 steps corner to corner, minus the lamp's own cell
+    tr = LayoutTrainer(task, max_blocks=12, seed=0, workers=0)
+    assert tr.max_blocks > 15
+    assert Trainer(task, max_blocks=12, seed=0, workers=0).max_blocks == tr.max_blocks
+    assert LayoutTrainer(task, max_blocks=30, seed=0, workers=0).max_blocks == 30  # enough: left alone
+
+
+@pytest.mark.parametrize("out_y,height", [(0, 1), (2, 3)])
+def test_layout_trainer_wires_opposite_corners_quickly(out_y, height):
+    """A single input and output in opposite corners used to stall for 1000+ generations."""
+    from redspark.designer import LayoutTrainer
+    task = corner_task(out_y, height)
+    tr = LayoutTrainer(task, max_blocks=12, seed=1, workers=0)
+    for _ in range(60):
+        tr.generation()
+        if tr.best.result.rows_passed == 2:
+            break
+    assert tr.best.result.rows_passed == 2

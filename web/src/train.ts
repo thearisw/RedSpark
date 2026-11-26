@@ -420,6 +420,11 @@ export class TrainMode {
       this.chart.add(msg.stats);
       const last = msg.stats[msg.stats.length - 1];
       const restarts = msg.stats.filter((x) => x.restarted).length;
+      const budget = $<HTMLInputElement>("maxBlocks");
+      if (msg.max_blocks && Number(budget.value) < msg.max_blocks) {
+        budget.value = String(msg.max_blocks);
+        this.status(`Max blocks raised to ${msg.max_blocks}: a wire from the inputs to the outputs needs more than you set.`);
+      }
       if (restarts) this.status(`Stuck for a while, so training started over with fresh networks (gen ${msg.stats.filter((x) => x.restarted).pop()!.gen}). The best circuit so far is kept.`);
       const t = msg.rows_total;
       $("gen").textContent = String(msg.gen);

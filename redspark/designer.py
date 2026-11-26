@@ -512,6 +512,28 @@ def bounding_dims(c: Circuit) -> list[int]:
     return [int(v) for v in idx.max(axis=0) - idx.min(axis=0) + 1]
 
 
+def wire_blocks(task: TruthTableTask) -> int:
+    """Fewest blocks a plain wire needs to bring some input to every output.
+
+    For each output: the walking distance from the nearest input, minus one
+    (the input and lamp are already there), plus one support block for every
+    layer the wire has to climb or drop. A budget below this can never reach
+    the output, so training would stall however long it runs.
+    """
+    need = 0
+    for o in task.outputs.values():
+        best = min(abs(o[0] - i[0]) + abs(o[2] - i[2]) - 1 + 2 * abs(o[1] - i[1])
+                   for i in task.inputs.values())
+        need = max(need, best)
+    return max(0, need)
+
+
+def budget_for(task: TruthTableTask, max_blocks: int) -> int:
+    """The block budget to train with: what was asked for, or enough for the wires plus a few spare."""
+    need = wire_blocks(task)
+    return max(int(max_blocks), need + 3) if need >= int(max_blocks) else int(max_blocks)
+
+
 @dataclass
 class Individual:
     theta: np.ndarray | None    # None until a child is made from parent + noise
@@ -558,7 +580,8 @@ class Trainer:
         self.task = task
         self.builder = Builder(task)
         self.policy = Policy(self.builder.obs_size, self.builder.n_actions)
-        self.max_blocks = int(max_blocks)
+        # Never less than a wire from the inputs to the outputs needs (see budget_for).
+        self.max_blocks = budget_for(task, max_blocks)
         self.population = int(population)
         self.elites = int(elites)
         self.sigma = float(sigma)
@@ -844,10 +867,20 @@ class LayoutTrainer:
                  workers: int | None = None):
         self.task = task
         self.builder = Builder(task)
-        self.max_blocks = int(max_blocks)
+        # Never less than a wire from the inputs to the outputs needs (see budget_for).
+        self.max_blocks = budget_for(task, max_blocks)
         self.population = int(population)
         self.elites = int(elites)
         self.rng = np.random.default_rng(seed)
+        # Cells a wire can end in to light each output: beside it on its layer, or on top.
+        self._targets = [[q for q in [add(o, d) for d in (*HORIZONTAL, UP)]
+                          if all(0 <= q[i] < task.size[i] for i in range(3)) and q not in task.fixed]
+                         for o in task.outputs.values()]
+        # Laying whole wires only pays off when outputs are far from the inputs; next
+        # to each other (most gates) it just crowds out the edits that build logic.
+        need = wire_blocks(task)
+        self._wire_rate = 0.15 * float(np.clip((need - 4) / 6, 0.0, 1.0)) if need >= 6 else 0.0
+        self._wire_seed = need >= 6
         self.n_rows = len(task.rows)
         self.gen = 0
         self.best: Individual | None = None
@@ -870,9 +903,13 @@ class LayoutTrainer:
     # ------------------------------------------------------------ edits
     def _random_population(self) -> list[Individual]:
         out = []
-        for _ in range(self.population):
+        for k in range(self.population):
             lay = Layout(self.task)
+            if self._wire_seed and k % 4 == 0:  # far apart: a quarter start with a wire laid from an input towards an output
+                self._wire(lay, full=True)
             for _ in range(int(self.rng.integers(1, max(2, self.max_blocks // 2) + 1))):
+                if self._n_blocks(lay) >= self.max_blocks:
+                    break
                 self._add(lay)
             out.append(Individual(None, lay=lay))
         return out
@@ -984,11 +1021,97 @@ class LayoutTrainer:
                 return
             lay.place(p, block, facing)
 
+    def _wire(self, lay: Layout, full: bool = False) -> None:
+        """Lay a dust run from an existing block towards an output, as one move.
+
+        Single-block edits grow a wire one cell at a time, and each cell only
+        helps a little, so a long wire (corner to corner on a 9 x 9 grid needs
+        15 dust) takes very many lucky steps and often stalls. This edit starts
+        at one of the blocks closest to an output and walks towards a cell that
+        lights it, a random but always distance-reducing route: dust on the
+        floor or on a support block, a block plus dust on top to climb a layer
+        (mostly near the end, since raised dust needs support), dust one layer
+        down to drop, and now and then a repeater to restore the
+        signal. It stops at the target, at the block budget, or at an obstacle.
+        ``full`` lays the whole way; otherwise a random number of steps.
+        """
+        targets = self._targets[int(self.rng.integers(len(self._targets)))]
+        if not targets:
+            return
+        T = np.array(targets)
+        cells = np.argwhere((lay.block != Block.AIR) & ~np.isin(lay.block, [Block.LAMP]))
+        if not len(cells):
+            return
+        dist = np.abs(cells[:, None, :] - T[None, :, :]).sum(axis=2).min(axis=1)
+        order = np.argsort(dist + self.rng.random(len(dist)))  # nearest first, ties at random
+        start = order[min(len(order) - 1, int(self.rng.geometric(0.5)) - 1)]
+        cur = tuple(int(v) for v in cells[start])
+        t = targets[int(np.abs(T - np.array(cur)).sum(axis=1).argmin())]
+        steps = 10 ** 6 if full else int(self.rng.integers(1, 9))
+        size = self.task.size
+
+        def inside(p: Pos) -> bool:
+            return all(0 <= p[i] < size[i] for i in range(3))
+
+        def put(p: Pos, kind: Block, facing: int = 0) -> bool:
+            if not inside(p) or p in self.task.fixed:
+                return False
+            if lay.get(p) == kind and (kind != Block.REPEATER or int(lay.facing[p]) == facing):
+                return True
+            if lay.get(p) != Block.AIR or self._n_blocks(lay) >= self.max_blocks:
+                return False
+            if not lay.can_place(p, int(kind), facing):
+                return False
+            lay.place(p, kind, facing)
+            return True
+
+        def footing(p: Pos) -> bool:
+            """Make sure something holds dust or a repeater at p."""
+            return p[1] == 0 or lay.get(add(p, DOWN)) in BELOW_SUPPORT[Block.DUST] or put(add(p, DOWN), Block.SOLID)
+
+        for _ in range(steps):
+            if cur == t:
+                return
+            dy = t[1] - cur[1]
+            horiz = [d for d in HORIZONTAL if (DIRS[d][0] * (t[0] - cur[0]) > 0 or DIRS[d][2] * (t[2] - cur[2]) > 0)]
+            if not horiz:
+                if dy == 0:
+                    return
+                horiz = list(HORIZONTAL)  # right under or over the target: step aside to climb or drop
+            d = int(horiz[int(self.rng.integers(len(horiz)))])
+            if lay.get(cur) == Block.REPEATER:
+                d = int(lay.facing[cur])  # a repeater only sends its signal straight ahead
+            nxt = add(cur, d)
+            if not inside(nxt):
+                return
+            h = abs(t[0] - cur[0]) + abs(t[2] - cur[2])
+            # Climb late (a raised wire needs a support block under every dust), mostly.
+            if dy > 0 and lay.get(cur) == Block.DUST and (h <= dy or self.rng.random() < 0.1):
+                if lay.get(nxt) in (Block.AIR, Block.SOLID) and put(nxt, Block.SOLID) and put(add(nxt, UP), Block.DUST):
+                    cur = add(nxt, UP)
+                    continue
+                return
+            if dy < 0 and lay.get(nxt) == Block.AIR and lay.get(cur) == Block.DUST:  # drop a layer
+                low = add(nxt, DOWN)
+                if footing(low) and put(low, Block.DUST):
+                    cur = low
+                    continue
+                return
+            if lay.get(nxt) == Block.DUST:
+                cur = nxt
+                continue
+            kind = Block.REPEATER if self.rng.random() < 0.08 else Block.DUST
+            if not (footing(nxt) and put(nxt, kind, d)):
+                return
+            cur = nxt
+
     def _mutate(self, lay: Layout) -> Layout:
         child = lay.copy()
         for _ in range(int(self.rng.geometric(0.55))):  # 1 edit usually, sometimes several
             r = self.rng.random()
-            if r < 0.25:
+            if r < self._wire_rate:
+                self._wire(child)
+            elif r < 0.25:
                 self._motif(child)
             elif r < 0.5:
                 self._add(child)

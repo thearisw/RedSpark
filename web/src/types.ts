@@ -45,6 +45,7 @@ export type ServerMessage =
       running: boolean;
       gen: number;
       rows_total: number;
+      max_blocks: number | null; // block budget in use (raised if too small to wire every output)
       samples: number; // designs scored so far in this run
       simulated: number | null; // of those, the ones not taken from the cache (null: not tracked)
       stats: GenStats[];

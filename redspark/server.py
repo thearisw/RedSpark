@@ -30,11 +30,13 @@ client -> server
 
 server -> client
     {"type": "state", "name": ..., "circuit": {size, ticks, blocks: [...]}}
-    {"type": "train_progress", "running", "gen", "rows_total", "samples", "simulated",
+    {"type": "train_progress", "running", "gen", "rows_total", "max_blocks", "samples", "simulated",
        "stats": [{gen, best, mean, solved, new_best, blocks, samples}],
        "best_ever": {gen, rows, blocks, dims, delay}}             stats for every generation since the last message
                                                  samples: designs scored so far; simulated: those not
                                                  taken from the cache (null for the network method)
+                                                 max_blocks: the budget in use (raised if the asked one
+                                                 is too small for a wire to reach every output)
     {"type": "train_circuit", "gen", "kind", "sample", "rows_passed", "rows_total", "passed", "got", "blocks", "dims", "delay",
        "frames": [circuit per truth-table row]}   at most render_hz per second; "sample" is the
                                                  design's number in the run for show "samples", else null
@@ -246,6 +248,7 @@ class Training:
         await self.session.send({
             "type": "train_progress", "running": self.running, "gen": t.gen if t else 0,
             "rows_total": t.n_rows if t else 0, "stats": stats,
+            "max_blocks": t.max_blocks if t else None,
             "samples": t.samples if t else 0, "simulated": getattr(t, "simulated", None) if t else None,
             "best_ever": {"gen": t.best_gen, "rows": t.best.result.rows_passed, "blocks": t.best.blocks,
                           "dims": t.best.dims, "delay": t.best.result.delay} if t and t.best else None,
